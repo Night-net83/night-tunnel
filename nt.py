@@ -31,10 +31,10 @@ import tempfile
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import parse_qs
+from urllib.parse import parse_qs, urlparse
 
 NAME = "night-tunnel"
-VERSION = "1.3.1"
+VERSION = "1.4.0"
 BASE = os.environ.get("NT_BASE", "/etc/night-tunnel")
 STATE = BASE + "/state.json"
 GOST_CFG = BASE + "/gost.json"
@@ -1508,190 +1508,816 @@ def detached(*args):
 
 
 # ------------------------------------------------------------- web panel
-CSS = """body{font-family:system-ui,sans-serif;background:#0d1117;color:#e6edf3;margin:0;padding:20px}
-.w{max-width:980px;margin:auto}h1{font-size:22px}h2{font-size:16px;margin-top:28px;color:#9db4ff}
-table{width:100%;border-collapse:collapse}td,th{padding:7px 9px;border-bottom:1px solid #222a35;text-align:left;font-size:14px}
-input,select,button,textarea{background:#161b22;color:#e6edf3;border:1px solid #30363d;border-radius:6px;padding:6px 9px;font-size:14px}
-button{cursor:pointer;background:#1f6feb;border-color:#1f6feb}button.d{background:#8b1a1a;border-color:#8b1a1a}
-.up{color:#3fb950}.down{color:#f85149}.udp{color:#d29922}.m{background:#163b24;padding:8px;border-radius:6px;margin:10px 0}.m.e{background:#4a1515}
-.card{background:#11161d;border:1px solid #222a35;border-radius:10px;padding:14px;margin-top:12px}textarea{width:100%;height:90px}"""
+CSS = r"""
+:root{--bg:#070b14;--panel:rgba(17,25,42,.74);--line:rgba(148,163,184,.14);--line2:rgba(148,163,184,.26);
+--tx:#e8eef8;--mu:#8b99b5;--ac:#7c8cff;--ac2:#35d0ff;--ok:#34d399;--bad:#f87171;--warn:#fbbf24;--r:14px;color-scheme:dark}
+*{box-sizing:border-box}
+html{scroll-behavior:smooth}
+body{margin:0;min-height:100vh;color:var(--tx);font:14px/1.55 system-ui,-apple-system,"Segoe UI",Tahoma,Vazirmatn,sans-serif;
+background:radial-gradient(900px 520px at 88% -8%,rgba(124,140,255,.2),transparent 62%),
+radial-gradient(760px 460px at -6% 108%,rgba(53,208,255,.13),transparent 62%),var(--bg);background-attachment:fixed}
+a{color:var(--ac2)}
+b{font-weight:650}
+.mu{color:var(--mu)}.mono,code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;direction:ltr;unicode-bidi:plaintext}
+.ic{width:18px;height:18px;flex:none}
+.app{display:grid;grid-template-columns:236px minmax(0,1fr);min-height:100vh}
+.side{position:sticky;top:0;height:100vh;padding:20px 12px;display:flex;flex-direction:column;gap:4px;
+border-inline-end:1px solid var(--line);background:rgba(7,11,20,.62);backdrop-filter:blur(16px);overflow-y:auto}
+.brand{display:flex;align-items:center;gap:11px;padding:2px 10px 20px;font-weight:700;font-size:16px;letter-spacing:-.01em}
+.logo{width:36px;height:36px;border-radius:11px;flex:none;background:linear-gradient(135deg,var(--ac),var(--ac2));
+display:grid;place-items:center;box-shadow:0 8px 26px rgba(124,140,255,.38)}
+.logo svg{width:19px;height:19px}
+.nav-i{font:inherit;color:var(--mu);background:none;border:0;cursor:pointer;display:flex;align-items:center;gap:11px;
+padding:9px 12px;border-radius:11px;text-align:start;white-space:nowrap;transition:background .15s,color .15s}
+.nav-i:hover{background:rgba(148,163,184,.08);color:var(--tx)}
+.nav-i.on{color:#fff;background:linear-gradient(135deg,rgba(124,140,255,.28),rgba(53,208,255,.14));box-shadow:inset 0 0 0 1px rgba(124,140,255,.35)}
+.main{padding:26px clamp(16px,3vw,42px) 70px;max-width:1140px;width:100%}
+.top{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:22px}
+.top h1{margin:0;font-size:23px;letter-spacing:-.015em;margin-inline-end:6px}
+.grow{flex:1}
+.tab{display:none}
+.tab.on{display:block;animation:in .28s ease}
+@keyframes in{from{opacity:0;transform:translateY(7px)}to{opacity:1;transform:none}}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:var(--r);padding:18px 20px;margin-bottom:16px;backdrop-filter:blur(10px)}
+.card>h2{margin:0 0 12px;font-size:15px;font-weight:650}
+.card>h2+.hint{margin-top:-8px}
+.card.ok{border-color:rgba(52,211,153,.4)}.card.bad{border-color:rgba(248,113,113,.4)}
+.card.bad>h2{color:var(--bad)}.card.ok>h2{color:var(--ok)}
+.hint{color:var(--mu);font-size:13px;margin:6px 0 12px}
+.grid{display:grid;gap:14px;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));margin-bottom:16px}
+.stat{background:var(--panel);border:1px solid var(--line);border-radius:var(--r);padding:15px 17px;position:relative;overflow:hidden}
+.stat::before{content:"";position:absolute;inset-inline-start:0;top:0;bottom:0;width:3px;background:linear-gradient(var(--ac),var(--ac2));opacity:.7}
+.stat .k{color:var(--mu);font-size:12px;text-transform:uppercase;letter-spacing:.05em}
+.stat .v{font-size:22px;font-weight:700;margin:6px 0 2px;min-height:32px;display:flex;align-items:center}
+.stat .s{color:var(--mu);font-size:12px;min-height:18px}
+.scroll{overflow-x:auto}
+.tbl{width:100%;border-collapse:collapse}
+.tbl th{font-weight:600;color:var(--mu);font-size:12px;text-transform:uppercase;letter-spacing:.04em;text-align:start;padding:8px 10px;border-bottom:1px solid var(--line);white-space:nowrap}
+.tbl td{padding:10px;border-bottom:1px solid var(--line);vertical-align:middle}
+.tbl tr:last-child td{border-bottom:0}
+input,select,textarea{font:inherit;color:var(--tx);background:rgba(6,10,18,.72);border:1px solid var(--line2);border-radius:10px;
+padding:8px 11px;outline:none;max-width:100%;transition:border-color .15s,box-shadow .15s}
+input:focus,select:focus,textarea:focus{border-color:var(--ac);box-shadow:0 0 0 3px rgba(124,140,255,.22)}
+input::placeholder,textarea::placeholder{color:#59667f}
+input[type=checkbox]{accent-color:var(--ac);width:16px;height:16px;padding:0}
+textarea{width:100%;min-height:92px;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12.5px;resize:vertical;direction:ltr;text-align:left}
+input[type=password],input[name=ip],input[name=port],input[name=remote_ip],input[name=ports],input[name=udp],input[name=foreign_ip],
+input[name=iran_ip],input[name=sni],input[name=path],input[name=host],input[name=target],input[name=ssh_key],input[name=ssh_port],input[name=ssh_user],input.ltr{direction:ltr;text-align:left}
+.row{display:flex;flex-wrap:wrap;gap:10px;align-items:flex-end}
+.f{display:flex;flex-direction:column;gap:5px;font-size:12px;color:var(--mu)}
+.f input,.f select{font-size:14px}
+.ck{display:inline-flex;align-items:center;gap:8px;color:var(--tx);font-size:13px;padding:8px 0}
+.w-xs{width:64px}.w-s{width:92px}.w-m{width:150px}.w-l{width:250px}.w-f{width:100%}
+.btn{font:inherit;font-weight:600;cursor:pointer;color:#fff;border:0;border-radius:10px;padding:8px 15px;
+background:linear-gradient(135deg,var(--ac),#5a6bff);box-shadow:0 5px 18px rgba(90,107,255,.3);
+display:inline-flex;align-items:center;justify-content:center;gap:8px;transition:transform .1s,filter .15s;text-decoration:none}
+.btn:hover{filter:brightness(1.12)}.btn:active{transform:translateY(1px)}
+.btn.g{background:rgba(148,163,184,.1);box-shadow:none;border:1px solid var(--line2);color:var(--tx)}
+.btn.d{background:linear-gradient(135deg,#ef4444,#b91c1c);box-shadow:0 5px 18px rgba(239,68,68,.25)}
+.btn.s{padding:5px 11px;font-size:13px}
+.btn.busy{opacity:.65;pointer-events:none}
+.btn.busy::after{content:"";width:13px;height:13px;border-radius:50%;border:2px solid rgba(255,255,255,.35);border-top-color:#fff;animation:sp .7s linear infinite}
+@keyframes sp{to{transform:rotate(360deg)}}
+.pill{display:inline-flex;align-items:center;gap:6px;padding:2px 10px;border-radius:99px;font-size:12px;font-weight:650;
+border:1px solid var(--line2);color:var(--mu);white-space:nowrap}
+.pill::before{content:"";width:7px;height:7px;border-radius:50%;background:currentColor}
+.pill.up,.pill.active{color:var(--ok);background:rgba(52,211,153,.1);border-color:rgba(52,211,153,.32)}
+.pill.down,.pill.failed,.pill.inactive{color:var(--bad);background:rgba(248,113,113,.1);border-color:rgba(248,113,113,.35)}
+.pill.udp,.pill.activating,.pill.warn{color:var(--warn);background:rgba(251,191,36,.1);border-color:rgba(251,191,36,.35)}
+.pill.plain::before{display:none}
+.sw{position:relative;width:40px;height:23px;display:inline-block;vertical-align:middle}
+.sw input{opacity:0;position:absolute;inset:0;margin:0;width:100%;height:100%;cursor:pointer;z-index:1}
+.sw i{position:absolute;inset:0;border-radius:99px;background:rgba(148,163,184,.26);transition:background .2s}
+.sw i::after{content:"";position:absolute;top:3px;inset-inline-start:3px;width:17px;height:17px;border-radius:50%;background:#fff;transition:inset-inline-start .2s}
+.sw input:checked+i{background:linear-gradient(135deg,var(--ac),var(--ac2))}
+.sw input:checked+i::after{inset-inline-start:20px}
+.flash{padding:11px 15px;border-radius:12px;margin-bottom:16px;border:1px solid rgba(52,211,153,.38);background:rgba(52,211,153,.1);color:#c1f5df;word-break:break-word}
+.flash.e{border-color:rgba(248,113,113,.42);background:rgba(248,113,113,.1);color:#fecaca}
+.presets{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:10px}
+.preset{display:flex;flex-direction:column;align-items:flex-start;justify-content:flex-start;font:inherit;color:var(--tx);text-align:start;cursor:pointer;padding:13px 15px;border-radius:12px;width:100%;
+background:rgba(148,163,184,.06);border:1px solid var(--line2);transition:border-color .15s,transform .1s,background .15s}
+.preset:hover{border-color:var(--ac);background:rgba(124,140,255,.1)}.preset:active{transform:translateY(1px)}
+.preset b{display:block;margin-bottom:2px}.preset small{color:var(--mu);font-size:12px}
+.item{display:flex;flex-wrap:wrap;gap:12px;align-items:flex-end;justify-content:space-between;padding:14px 0;border-bottom:1px solid var(--line)}
+.item:last-child{border-bottom:0;padding-bottom:0}.item:first-child{padding-top:0}
+.item .hd{display:flex;align-items:center;gap:9px;width:100%;margin-bottom:-2px;flex-wrap:wrap}
+.kv{display:grid;grid-template-columns:max-content 1fr;gap:8px 18px;margin:0}
+.kv dt{color:var(--mu)}.kv dd{margin:0;word-break:break-all}
+.copy{display:flex;gap:8px;align-items:center}.copy input{flex:1;min-width:0;direction:ltr;text-align:left}
+.seg{font:inherit;color:var(--mu);background:rgba(148,163,184,.07);border:1px solid var(--line2);padding:6px 13px;border-radius:99px;cursor:pointer}
+.seg.on{color:#fff;border-color:var(--ac);background:rgba(124,140,255,.25)}
+pre.log{background:#04070f;border:1px solid var(--line);border-radius:12px;padding:12px 14px;max-height:480px;min-height:140px;overflow:auto;
+font:12px/1.55 ui-monospace,Menlo,Consolas,monospace;direction:ltr;text-align:left;white-space:pre-wrap;word-break:break-all;margin:12px 0 0;color:#b7c4dc}
+.login{min-height:100vh;display:grid;place-items:center;padding:20px}
+.login .card{width:100%;max-width:370px;padding:30px 28px;margin:0}
+.login h1{margin:14px 0 4px;font-size:24px;letter-spacing:-.02em}
+.login .logo{width:48px;height:48px;border-radius:14px}.login .logo svg{width:25px;height:25px}
+.login form{display:grid;gap:12px;margin-top:20px}.login input{width:100%}
+.dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--mu);margin-inline-end:8px}
+ul.rec{margin:8px 0 0;padding-inline-start:20px}ul.rec li{margin:4px 0}
+@media(max-width:860px){
+.app{grid-template-columns:minmax(0,1fr)}
+.side{position:sticky;top:0;z-index:5;height:auto;flex-direction:row;align-items:center;padding:9px 10px;gap:3px;overflow-x:auto;
+border-inline-end:0;border-bottom:1px solid var(--line)}
+.brand{padding:0 8px 0 4px}.brand span{display:none}
+.nav-i{padding:8px 12px;font-size:13px}
+.main{padding-top:18px}
+.kv{grid-template-columns:1fr}
+}
+"""
 
-LOGIN = """<!doctype html><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">
-<title>night-tunnel</title><style>%s</style><div class=w style="max-width:340px;margin-top:12vh">
-<h1>night-tunnel</h1>%s<form method=post action="login"><p><input name=u placeholder=user style="width:100%%"></p>
-<p><input name=p type=password placeholder=password style="width:100%%"></p><button>Login</button></form></div>"""
+JS_TPL = r"""
+(function(){
+var FA=__FA__;
+var $=function(s,r){return (r||document).querySelector(s)};
+var $$=function(s,r){return [].slice.call((r||document).querySelectorAll(s))};
+var lang='en',cur='',logSvc='gost';
+try{lang=localStorage.getItem('ntl')||'en'}catch(e){}
+function tr(s){return lang==='fa'&&FA[s]?FA[s]:s}
+function walk(){
+ var w=document.createTreeWalker(document.body,NodeFilter.SHOW_TEXT,null),n,list=[];
+ while((n=w.nextNode())){list.push(n)}
+ list.forEach(function(n){
+  if(n.__o===undefined){var p=n.parentNode&&n.parentNode.nodeName;if(p==='SCRIPT'||p==='STYLE'||p==='TEXTAREA'||p==='PRE'){n.__o=null}else{n.__o=n.nodeValue}}
+  if(n.__o===null)return;
+  var m=/^(\s*)([\s\S]*?)(\s*)$/.exec(n.__o);
+  var key=m[2].replace(/\s+/g,' ');
+  n.nodeValue=(lang==='fa'&&FA[key])?m[1]+FA[key]+m[3]:n.__o;
+ });
+ $$('[placeholder],[title],[data-c]').forEach(function(e){
+  ['placeholder','title','data-c'].forEach(function(a){
+   if(!e.hasAttribute(a))return;var k='_o_'+a;
+   if(e[k]===undefined)e[k]=e.getAttribute(a);
+   if(a!=='data-c')e.setAttribute(a,tr(e[k]));
+  });
+ });
+}
+function applyLang(){
+ document.documentElement.lang=lang;document.documentElement.dir=lang==='fa'?'rtl':'ltr';
+ walk();var b=$('#lang');if(b)b.textContent=lang==='fa'?'English':'فارسی';
+ var t=$('#ttl'),on=$('.nav-i.on');if(t&&on)t.textContent=on.textContent.trim();
+}
+function show(t){
+ var ids=$$('.tab').map(function(x){return x.id.slice(4)});
+ if(!ids.length)return;
+ if(ids.indexOf(t)<0)t=ids[0];
+ cur=t;
+ $$('.tab').forEach(function(x){x.classList.toggle('on',x.id==='tab-'+t)});
+ $$('.nav-i').forEach(function(b){b.classList.toggle('on',b.dataset.tab===t)});
+ var on=$('.nav-i.on'),h=$('#ttl');if(h&&on)h.textContent=on.textContent.trim();
+ if(t==='logs')loadLog();
+}
+function loadLog(s){
+ if(s)logSvc=s;var box=$('#logbox');if(!box)return;
+ $$('[data-log]').forEach(function(b){b.classList.toggle('on',b.dataset.log===logSvc)});
+ box.textContent='...';
+ fetch('logs?svc='+logSvc+'&n='+$('#logn').value,{credentials:'same-origin',cache:'no-store'})
+ .then(function(r){return r.text()}).then(function(t){box.textContent=t;box.scrollTop=box.scrollHeight})
+ .catch(function(){box.textContent='Could not load the log.'});
+}
+function copyText(id){
+ var e=$(id);if(!e)return;var v=e.value!==undefined?e.value:e.textContent;
+ var done=function(){var b=$('[data-copy="'+id+'"]');if(b){var o=b.textContent;b.textContent=tr('Copied');setTimeout(function(){b.textContent=o},1400)}};
+ if(navigator.clipboard&&window.isSecureContext){navigator.clipboard.writeText(v).then(done,function(){})}
+ else{e.select&&e.select();try{document.execCommand('copy');done()}catch(x){}}
+}
+document.addEventListener('click',function(e){
+ var t=e.target.closest('[data-tab]');if(t){location.hash=t.dataset.tab;return}
+ t=e.target.closest('[data-log]');if(t){loadLog(t.dataset.log);return}
+ t=e.target.closest('[data-gologs]');if(t){logSvc=t.dataset.gologs;location.hash='logs';show('logs');return}
+ t=e.target.closest('[data-copy]');if(t){copyText(t.dataset.copy);return}
+ t=e.target.closest('[data-reload]');if(t){loadLog();return}
+ if(e.target.id==='lang'){lang=lang==='fa'?'en':'fa';try{localStorage.setItem('ntl',lang)}catch(x){}applyLang()}
+});
+document.addEventListener('submit',function(e){
+ var f=e.target;
+ if(f.dataset.c&&!confirm(tr(f.dataset.c))){e.preventDefault();return}
+ if(f.method==='post'&&cur){var i=document.createElement('input');i.type='hidden';i.name='tab';i.value=cur;f.appendChild(i)}
+ var b=e.submitter||$('button:not([type=button])',f);if(b)setTimeout(function(){b.classList.add('busy')},0);
+});
+var ln=$('#logn');if(ln)ln.addEventListener('change',function(){loadLog()});
+window.addEventListener('hashchange',function(){show(location.hash.slice(1))});
+show(location.hash.slice(1));applyLang();
+// live status
+var run=document.body.dataset.run==='1';
+function poll(){
+ if(document.hidden||!$('.app'))return;
+ fetch('status',{credentials:'same-origin',cache:'no-store'}).then(function(r){return r.json()}).then(function(d){
+  $$('[data-svc]').forEach(function(e){var s=d.svc[e.dataset.svc];if(s){e.className='pill '+s;e.textContent=tr(s)}});
+  $$('[data-tp]').forEach(function(e){var s=d.tp[e.dataset.tp];if(s){e.className='pill '+s;e.textContent=tr(s)}});
+  var u=$('[data-upcount]');if(u){var n=0;for(var k in d.tp)if(d.tp[k]==='up')n++;u.textContent=n}
+  var w=$('#wg');if(w&&d.wg)w.textContent=d.wg;
+  var bl=$('#benchlog');if(bl)bl.textContent=d.bench.log||'';
+  var wl=$('#wizlog');if(wl&&d.wiz.log)wl.textContent=d.wiz.log;
+  if(run&&!d.bench.running&&!d.wiz.running)location.reload();
+ }).catch(function(){});
+}
+setInterval(poll,run?3500:9000);
+})();
+"""
+
+
+FA_TEXT = {
+    # navigation / titles
+    "Overview": "نمای کلی", "Transports": "ترنسپورت‌ها", "Ports": "پورت‌ها", "Tunnels": "تانل‌ها", "Token": "توکن",
+    "Test": "تست", "Telegram proxy": "پروکسی تلگرام", "Security": "امنیت", "Logs": "لاگ‌ها", "System": "سیستم",
+    "Easy setup": "نصب آسان", "Logout": "خروج", "Login": "ورود", "Sign in to the control panel": "ورود به پنل مدیریت",
+    "Iran · entry": "ایران · ورودی", "Foreign · exit": "خارج · خروجی", "Not configured": "تنظیم نشده",
+    "user": "نام کاربری", "password": "رمز عبور", "Wrong credentials": "نام کاربری یا رمز اشتباه است",
+    # states
+    "up": "فعال", "down": "قطع", "active": "فعال", "inactive": "غیرفعال", "failed": "خطا", "off": "خاموش",
+    "udp": "UDP", "unknown": "نامشخص", "none": "ندارد", "encrypted": "رمزگذاری‌شده", "plain": "بدون رمزنگاری",
+    # overview
+    "Engine (gost)": "موتور (gost)", "Relay pool": "استخر ریلی", "Kernel links": "لینک‌های کرنلی", "MTProto": "MTProto",
+    "IP-locked": "قفل روی IP", "Relay login required": "ورود به ریلی اجباری است", "Only the Iran IP is allowed": "فقط IP ایران مجاز است",
+    "Transports up": "ترنسپورت‌های فعال", "Forwarded ports": "پورت‌های فوروارد", "Transport health": "سلامت ترنسپورت‌ها",
+    "Tunnel": "تانل", "Type": "نوع", "Port": "پورت", "Data": "داده", "State": "وضعیت", "Server": "سرور", "Role": "نقش",
+    "Iran (entry)": "ایران (ورودی)", "Foreign (exit)": "خارج (خروجی)", "Foreign IP": "آی‌پی خارج", "Iran IP": "آی‌پی ایران",
+    "Mode": "حالت", "WireGuard handshake": "هندشیک وایرگارد", "Version": "نسخه", "Quick actions": "اقدام‌های سریع",
+    "Restart tunnel services": "ری‌استارت سرویس‌های تانل", "Quick connection test": "تست سریع اتصال", "View logs": "مشاهده لاگ",
+    # transports
+    "Transport pool": "استخر ترنسپورت", "On": "روشن", "Priority": "اولویت", "ID": "شناسه",
+    "Failover (priority order)": "فیل‌اور (به ترتیب اولویت)", "Rotate (round-robin per connection)": "چرخشی (برای هر کانکشن)",
+    "Random per connection": "تصادفی برای هر کانکشن", "Save & apply": "ذخیره و اعمال",
+    "Turn transports on or off and set their order. Lower priority number = tried first.": "ترنسپورت‌ها را روشن/خاموش کنید و ترتیبشان را بدهید. عدد کمتر = اول امتحان می‌شود.",
+    "Presets": "پریست‌ها", "Balanced": "متعادل", "Mixed transports with a backup": "ترکیب ترنسپورت‌ها همراه پشتیبان",
+    "Stealth": "مخفی", "Looks like normal TLS / web traffic": "شبیه ترافیک عادی TLS / وب",
+    "Gaming": "گیمینگ", "UDP transports first": "اول ترنسپورت‌های UDP", "Rotate": "چرخشی",
+    "Spread connections over everything": "پخش کانکشن‌ها روی همه ترنسپورت‌ها",
+    "One click re-orders and enables a sensible set.": "با یک کلیک ترتیب و فعال‌سازی مناسب اعمال می‌شود.",
+    # ports
+    "Protocol": "پروتکل", "Remote port": "پورت مقصد", "Path": "مسیر", "Save": "ذخیره", "Delete": "حذف",
+    "Delete this port?": "این پورت حذف شود؟", "Add a port": "افزودن پورت", "Add port": "افزودن پورت",
+    "No forwarded ports yet.": "هنوز پورتی فوروارد نشده.",
+    "Each port on this server goes to 127.0.0.1 on the foreign server.": "هر پورت روی این سرور به 127.0.0.1 سرور خارج می‌رود.",
+    # tunnels
+    "Your tunnels": "تانل‌های شما", "SNI": "SNI", "Host": "هاست", "Name": "نام", "Build tunnel": "ساخت تانل",
+    "Build a new tunnel": "ساخت تانل جدید", "Delete this tunnel?": "این تانل حذف شود؟",
+    "Change a port, type, SNI, path or host. After any change copy the new token to the Iran server.": "پورت، نوع، SNI، مسیر یا هاست را تغییر دهید. بعد از هر تغییر توکن جدید را در سرور ایران وارد کنید.",
+    "You can build several tunnels of one type (use different names, ports or SNI). Kernel tunnels (L3) can also be used as direct port paths on the Iran server.": "از هر نوع می‌توانید چند تانل بسازید (با نام، پورت یا SNI متفاوت). تانل‌های کرنلی (L3) را می‌توان مستقیم به‌عنوان مسیر پورت در سرور ایران هم استفاده کرد.",
+    # token
+    "Token for the Iran server": "توکن برای سرور ایران", "Copy": "کپی", "Copied": "کپی شد",
+    "On the Iran server open Token and import this value (Sync token). Do it after every change here.": "در سرور ایران به بخش «توکن» بروید و این مقدار را وارد کنید (Sync). بعد از هر تغییر اینجا این کار را انجام دهید.",
+    "Sync token": "همگام‌سازی توکن", "Import token": "وارد کردن توکن",
+    "Paste the token from the foreign server's panel after you change anything there.": "بعد از هر تغییر در سرور خارج، توکن را از پنل آن اینجا پیست کنید.",
+    # test
+    "Test tunnels": "تست تانل‌ها", "Run the test from the Iran server's panel (the entry side). This server answers the test automatically.": "تست را از پنل سرور ایران (سمت ورودی) اجرا کنید. این سرور خودکار پاسخ می‌دهد.",
+    "Full test (connect + speed)": "تست کامل (اتصال + سرعت)", "Quick test (connect + latency)": "تست سریع (اتصال + تأخیر)",
+    "Speed tests use real bandwidth for about 10 seconds per tunnel.": "تست سرعت حدود ۱۰ ثانیه برای هر تانل از پهنای باند واقعی استفاده می‌کند.",
+    "Layer": "لایه", "RTT ms": "RTT (ms)", "Jitter": "جیتر", "Loss": "لاس", "Down Mb/s": "دانلود Mb/s", "Up Mb/s": "آپلود Mb/s",
+    "Encrypted": "رمزگذاری", "Score": "امتیاز", "Recommendation": "پیشنهاد", "Apply suggested order": "اعمال ترتیب پیشنهادی",
+    "Enable only the working tunnels in the suggested order?": "فقط تانل‌های سالم به ترتیب پیشنهادی فعال شوند؟",
+    # security
+    "Security mode": "حالت امنیتی", "With password": "با رمز", "No password": "بدون رمز",
+    "Relay login is required. TLS / QUIC / WireGuard tunnels are encrypted. Plain tunnels (tcp, ws, kcp, udp, ...) are authenticated but carry data unencrypted.": "ورود به ریلی اجباری است. تانل‌های TLS / QUIC / WireGuard رمزگذاری‌شده‌اند. تانل‌های ساده (tcp, ws, kcp, udp, ...) احراز هویت می‌شوند ولی داده رمزگذاری‌نشده است.",
+    "Switch to NO password": "تغییر به حالت بدون رمز", "Switch to password mode": "تغییر به حالت با رمز",
+    "Change the security mode? Then copy the new token to the Iran server.": "حالت امنیتی عوض شود؟ بعد توکن جدید را در سرور ایران وارد کنید.",
+    "Change it on the foreign server, then Sync token here.": "آن را در سرور خارج تغییر دهید، سپس اینجا توکن را Sync کنید.",
+    # telegram
+    "Telegram proxy (MTProto, fake-TLS)": "پروکسی تلگرام (MTProto، فیک‌TLS)", "Cover domain": "دامنه پوششی",
+    "Restart": "ری‌استارت", "New secret": "سکرت جدید", "Remove proxy": "حذف پروکسی",
+    "Old links will stop working. Continue?": "لینک‌های قبلی از کار می‌افتند. ادامه می‌دهید؟",
+    "Remove the Telegram proxy?": "پروکسی تلگرام حذف شود؟",
+    "Runs on this server, independent of the tunnels. Share the link with people who need it.": "روی همین سرور و مستقل از تانل‌ها اجرا می‌شود. لینک را با کسانی که لازم دارند به اشتراک بگذارید.",
+    "Change port or cover domain": "تغییر پورت یا دامنه پوششی", "Apply": "اعمال",
+    "The secret is regenerated, so share the new link afterwards.": "سکرت دوباره ساخته می‌شود؛ بعدش لینک جدید را به اشتراک بگذارید.",
+    "Server IP": "آی‌پی سرور", "Create proxy": "ساخت پروکسی",
+    "Runs on this server, independent of the tunnels. Use a server that can reach Telegram (usually the foreign one). You get a link to share.": "روی همین سرور و مستقل از تانل‌ها اجرا می‌شود. سروری را انتخاب کنید که به تلگرام دسترسی دارد (معمولاً سرور خارج). یک لینک برای اشتراک می‌گیرید.",
+    # logs
+    "Engine": "موتور", "Panel": "پنل", "Telegram": "تلگرام", "Refresh": "تازه‌سازی",
+    "Latest lines from the systemd journal.": "آخرین خط‌های ژورنال systemd.",
+    # system
+    "Update tunnel settings": "به‌روزرسانی تنظیمات تانل", "Rotate credentials + WireGuard keys": "چرخش رمزها و کلیدهای WireGuard",
+    "Update tunnel": "به‌روزرسانی تانل", "SNI ": "SNI",
+    "Use it after getting a new server IP or to rotate keys. Then copy the new token to the Iran server.": "بعد از گرفتن آی‌پی جدید یا برای چرخش کلیدها استفاده کنید. سپس توکن جدید را در سرور ایران وارد کنید.",
+    "Use it after getting a new server IP or to rotate keys. Make the same change on the foreign server, then Sync token.": "بعد از گرفتن آی‌پی جدید یا برای چرخش کلیدها استفاده کنید. همین تغییر را در سرور خارج هم بدهید، سپس توکن را Sync کنید.",
+    "Network speed (BBR)": "سرعت شبکه (BBR)", "Enable BBR": "فعال‌سازی BBR", "BBR on": "BBR فعال",
+    "BBR usually gives better throughput on long, lossy links.": "BBR معمولاً روی لینک‌های طولانی و پرلاس سرعت بهتری می‌دهد.",
+    "Panel password": "رمز پنل", "New password": "رمز جدید", "Repeat": "تکرار", "Change password": "تغییر رمز",
+    "At least 8 characters. The panel login user stays the same.": "حداقل ۸ کاراکتر. نام کاربری پنل تغییر نمی‌کند.",
+    "Maintenance": "نگهداری", "Check for update": "بررسی آپدیت", "Update night-tunnel": "آپدیت night-tunnel",
+    "Update engine (gost)": "آپدیت موتور (gost)", "Update the script?": "اسکریپت آپدیت شود؟", "Update gost?": "gost آپدیت شود؟",
+    "Restart tunnel": "ری‌استارت تانل", "Danger zone": "منطقه خطر", "Type DELETE to confirm.": "برای تأیید DELETE را تایپ کنید.",
+    "Delete tunnel config (keep installed)": "حذف کانفیگ تانل (نصب بماند)", "also remove gost binary": "فایل gost هم حذف شود",
+    "Uninstall night-tunnel completely": "حذف کامل night-tunnel",
+    "UDP transports are not probed": "ترنسپورت‌های UDP تست نمی‌شوند", "Installed version": "نسخه نصب‌شده", "Last run": "آخرین اجرا",
+    "Current congestion control": "الگوریتم فعلی کنترل ازدحام", "Failover": "فیل‌اور", "Random": "تصادفی",
+    # wizard
+    "Easy setup finished": "نصب آسان تمام شد", "Dismiss": "بستن", "Shown once - save it now.": "فقط یک‌بار نشان داده می‌شود؛ همین حالا ذخیره کنید.",
+    "Other server's panel": "پنل سرور مقابل", "User": "کاربر", "Password": "رمز",
+    "Setting up...": "در حال نصب...", "This page updates by itself. It can take a few minutes.": "این صفحه خودکار به‌روز می‌شود. ممکن است چند دقیقه طول بکشد.",
+    "This server is the": "این سرور،", "Iran (entry) server": "سرور ایران (ورودی)", "foreign (exit) server": "سرور خارج (خروجی)",
+    "IP of the OTHER server": "آی‌پی سرور مقابل", "SSH port": "پورت SSH", "SSH user": "یوزر SSH",
+    "SSH password of the other server": "رمز SSH سرور مقابل", "or SSH key file on this server": "یا فایل کلید SSH روی همین سرور",
+    "With password (encrypted, recommended)": "با رمز (رمزگذاری‌شده، پیشنهادی)", "No password (limited to the Iran IP)": "بدون رمز (محدود به IP ایران)",
+    "Ports to forward on the Iran server": "پورت‌های فوروارد روی سرور ایران", "Ports that also need UDP (optional)": "پورت‌هایی که UDP هم می‌خواهند (اختیاری)",
+    "Overwrite an existing night-tunnel config on the other server": "کانفیگ قبلی night-tunnel روی سرور مقابل بازنویسی شود",
+    "Build the tunnel automatically": "ساخت خودکار تانل",
+    "Give the other server's IP and root SSH login. This server installs night-tunnel there, creates both sides of the tunnel and runs a first test. The SSH password is used once and not stored.": "آی‌پی سرور مقابل و لاگین root آن را بدهید. این سرور night-tunnel را آنجا نصب می‌کند، هر دو سمت تانل را می‌سازد و یک تست اولیه می‌زند. پسورد SSH یک‌بار استفاده می‌شود و ذخیره نمی‌شود.",
+}
+
+JS = JS_TPL.replace("__FA__", json.dumps(FA_TEXT, ensure_ascii=False))
+
+
+# ---- helpers: status, logs, icons, small components
+MODE_LABEL = {"fifo": "Failover", "round": "Rotate", "rand": "Random"}
+SVCS = {"gost": "night-tunnel-gost", "l3": "night-tunnel-l3", "panel": "night-tunnel-panel", "tg": "night-tunnel-tg"}
+ICONS = {
+    "home": "<path d='M3 11l9-8 9 8v10a1 1 0 0 1-1 1h-5v-7H9v7H4a1 1 0 0 1-1-1z'/>",
+    "layers": "<path d='M12 2l10 5-10 5L2 7z'/><path d='M2 17l10 5 10-5'/><path d='M2 12l10 5 10-5'/>",
+    "swap": "<path d='M4 7h14l-3-3M20 17H6l3 3'/>",
+    "tunnel": "<path d='M3 12h4l3-8 4 16 3-8h4'/>",
+    "key": "<circle cx='8' cy='15' r='4'/><path d='M11 12l9-9M16 7l3 3'/>",
+    "gauge": "<path d='M12 14l4-4'/><path d='M3.3 17a10 10 0 1 1 17.4 0'/>",
+    "send": "<path d='M22 2L11 13'/><path d='M22 2l-7 20-4-9-9-4z'/>",
+    "shield": "<path d='M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z'/>",
+    "terminal": "<path d='M4 17l6-6-6-6M12 19h8'/>",
+    "settings": "<path d='M4 21v-7M4 10V3M12 21v-9M12 8V3M20 21v-5M20 12V3M1 14h6M9 8h6M17 16h6'/>",
+    "wand": "<path d='M15 4V2M15 16v-2M8 9h2M20 9h2M17.8 11.8L19 13M17.8 6.2L19 5M3 21l9-9M12.2 6.2L11 5'/>",
+}
+MOON = ("<svg viewBox='0 0 24 24' fill='none' stroke='#fff' stroke-width='2' stroke-linecap='round' "
+        "stroke-linejoin='round'><path d='M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z'/></svg>")
+
+
+def ico(n):
+    return (f"<svg class=ic viewBox='0 0 24 24' fill=none stroke=currentColor stroke-width=2 stroke-linecap=round "
+            f"stroke-linejoin=round>{ICONS[n]}</svg>")
+
+
+def svc_states():
+    out = sh("systemctl is-active " + " ".join(SVCS.values())).stdout.split()
+    s = dict(zip(SVCS, out)) if len(out) == len(SVCS) else {k: "unknown" for k in SVCS}
+    if not tg_load():
+        s["tg"] = "off"
+    return s
+
+
+def wg_age(st):
+    if "wg" not in (st.get("l3") or {}):
+        return ""
+    out = sh(f"wg show {DEV['wg']} latest-handshakes").stdout.split()
+    try:
+        ts = max(int(x) for x in out[1::2])
+    except ValueError:
+        return "no handshake yet"
+    if ts <= 0:
+        return "no handshake yet"
+    age = max(0, int(time.time()) - ts)
+    return f"{age}s ago" if age < 120 else f"{age // 60}m ago"
+
+
+def status_json(st):
+    pr = probe_all(st) if st["role"] != "new" else {}
+    last = lambda lg: (lg[-1] if lg else "").lstrip(ERR)
+    return json.dumps({"svc": svc_states(), "tp": pr, "wg": wg_age(st),
+                       "bench": {"running": BENCH_STATE["running"], "log": last(BENCH_STATE["log"])},
+                       "wiz": {"running": WIZ["running"], "log": "\n".join(WIZ["log"])}})
+
+
+def read_logs(svc, n):
+    unit = SVCS.get(svc)
+    if not unit:
+        return "Unknown service."
+    try:
+        n = max(10, min(int(n), 500))
+    except (TypeError, ValueError):
+        n = 100
+    r = sh(f"journalctl -u {unit} -n {n} --no-pager -o short-iso")
+    return (r.stdout or r.stderr).strip() or "(no log lines)"
 
 
 def esc(x):
     return html.escape(str(x))
 
 
-def form(action_vals, inner, confirm="", style="margin:0;display:inline"):
-    hid = "".join(f"<input type=hidden name={k} value='{esc(v)}'>" for k, v in action_vals.items())
-    oc = f" onsubmit=\"return confirm('{confirm}')\"" if confirm else ""
-    return f"<form method=post action=api style='{style}'{oc}>{hid}{inner}</form>"
+def pill(state, **attrs):
+    a = "".join(f" data-{k}='{esc(v)}'" for k, v in attrs.items())
+    return f"<span class='pill {esc(state)}'{a}>{esc(state)}</span>"
 
 
-def render_bench(st):
-    h = "<div class=card><h2 style='margin-top:0'>Test tunnels (connection + speed + recommendation)</h2>"
-    if st["role"] != "iran":
-        return (h + "<p style='color:#8b949e'>Run the test from the <b>Iran</b> server's panel (the entry side). "
-                "This server answers the test automatically.</p></div>")
-    if BENCH_STATE["running"]:
-        last = BENCH_STATE["log"][-1] if BENCH_STATE["log"] else "starting"
-        h += f"<div class=m>Running: {esc(last)} (page refreshes by itself)</div>"
-    else:
-        err = next((x for x in reversed(BENCH_STATE["log"]) if x.startswith(ERR)), "")
-        if err:
-            h += f"<div class='m e'>{esc(err.lstrip(ERR))}</div>"
-        h += (form({"a": "test", "full": "1"}, "<button>Full test (connect + speed)</button>") + " "
-              + form({"a": "test", "full": "0"}, "<button>Quick test (connect + latency)</button>"))
-    try:
-        with open(BENCH) as f:
-            rep = json.load(f)
-    except (OSError, ValueError):
-        return h + "<p style='color:#8b949e'>No test run yet. Speed tests use real bandwidth for ~10s per tunnel.</p></div>"
-    rows = ""
-    for r in sorted(rep["results"], key=lambda r: -r["score"]):
-        if r["ok"]:
-            rows += (f"<tr><td><b>{esc(r['name'])}</b></td><td>{esc(r['layer'])}</td><td class=up>OK</td>"
-                     f"<td>{r['rtt']}</td><td>{r['jitter']}</td><td>{int(r['loss'] * 100)}%</td>"
-                     f"<td>{r.get('down', '-')}</td><td>{r.get('up', '-')}</td>"
-                     f"<td>{esc(r.get('enc', '-'))}</td>"
-                     f"<td class={'down' if r.get('auth') == 'OPEN' else 'up'}>{esc(r.get('auth', '-'))}</td>"
-                     f"<td>{r['score']}</td></tr>")
-        else:
-            rows += (f"<tr><td><b>{esc(r['name'])}</b></td><td>{esc(r['layer'])}</td><td class=down>FAIL</td>"
-                     f"<td colspan=8 style='color:#8b949e'>{esc(r.get('err', ''))}</td></tr>")
-    when = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(rep["ts"]))
-    h += (f"<p style='color:#8b949e'>Last run: {when}</p><table><tr><th>Tunnel</th><th>Layer</th><th>State</th>"
-          f"<th>RTT ms</th><th>Jitter</th><th>Loss</th><th>Down Mb/s</th><th>Up Mb/s</th>"
-          f"<th>Encrypted</th><th>Password</th><th>Score</th></tr>{rows}</table>"
-          "<h2>Recommendation</h2><ul>" + "".join(f"<li>{esc(x)}</li>" for x in rep["rec"]["lines"]) + "</ul>")
-    if rep["rec"]["order"] and not BENCH_STATE["running"]:
-        h += form({"a": "benchapply"}, "<button>Apply suggested order (enable only working tunnels)</button>",
-                  confirm="Enable only the working tunnels in the suggested order?")
-    return h + "</div>"
+def form(vals, inner, confirm="", cls=""):
+    hid = "".join(f"<input type=hidden name={k} value='{esc(v)}'>" for k, v in vals.items())
+    c = f" data-c='{esc(confirm)}'" if confirm else ""
+    return f"<form method=post action=api class='{cls}'{c}>{hid}{inner}</form>"
 
 
-def render_update(st):
-    f = st["role"] == "foreign"
-    return ("<div class=card><h2 style='margin-top:0'>Update tunnel settings</h2>"
-            + form({"a": "updtunnel"},
-                   f"foreign IP <input name=foreign_ip value='{esc(st['foreign_ip'])}' size=15> "
-                   f"Iran IP <input name=iran_ip value='{esc(st['iran_ip'])}' size=15> "
-                   f"SNI <input name=sni value='{esc(st.get('sni', ''))}' size=18> "
-                   + ("<label><input type=checkbox name=rotate> rotate credentials + WireGuard keys</label> " if f else "")
-                   + "<button>Update tunnel</button>", style="display:block")
-            + "<p style='color:#8b949e'>Use it after getting a new server IP or to rotate keys. "
-              + ("Then copy the new token to the Iran server." if f else "Make the same change on the foreign server, then Sync token.")
-            + "</p></div>")
+def fld(label, inner):
+    return f"<label class=f><span>{label}</span>{inner}</label>"
 
 
-def render_dash(st, msg=""):
-    pr = probe_all(st)
-    svc = sh("systemctl is-active night-tunnel-gost").stdout.strip()
+def tdesc(t):
+    return desc(t).replace(" [enc]", "").replace(" [plain]", "")
+
+
+def encpill(t):
+    return "<span class='pill up'>encrypted</span>" if enc_of(t) == "yes" else "<span class='pill udp'>plain</span>"
+
+
+def card(title, body, hint="", cls=""):
+    h = f"<p class=hint>{hint}</p>" if hint else ""
+    t = f"<h2>{title}</h2>" if title else ""
+    return f"<div class='card {cls}'>{t}{h}{body}</div>"
+
+
+def vsel(st, cur):
+    return ("<select name=via><option value=pool>relay pool</option>" + "".join(
+        f"<option value={k} {'selected' if cur == k else ''}>kernel: {CARRIERS[k][0]}</option>"
+        for k in (st.get("l3") or {})) + "</select>")
+
+
+# ---- tabs
+def render_overview(st, states, pr):
     iran = st["role"] == "iran"
+    up = sum(1 for v in pr.values() if v == "up")
+    tcp = sum(1 for v in pr.values() if v != "udp")
+    udp = len(pr) - tcp
+
+    def stat(k, v, s=""):
+        return f"<div class=stat><div class=k>{k}</div><div class=v>{v}</div><div class=s>{s}</div></div>"
+    l3 = st.get("l3") or {}
+    s = [stat("Engine (gost)", pill(states["gost"], svc="gost"), "Relay pool"),
+         stat("Kernel links", pill(states["l3"], svc="l3") if l3 else "<span class='pill plain'>none</span>",
+              esc(", ".join(CARRIERS[k][0] for k in l3))),
+         stat("Telegram proxy", pill(states["tg"], svc="tg"), "MTProto"),
+         stat("Security", "<span class='pill up'>password</span>" if is_secure(st)
+              else "<span class='pill udp'>IP-locked</span>",
+              "Relay login required" if is_secure(st) else "Only the Iran IP is allowed"),
+         stat("Transports up", f"<span data-upcount>{up}</span>&nbsp;/&nbsp;{tcp}",
+              f"<span class=mono>{udp}</span> <span>UDP transports are not probed</span>" if udp else "")]
+    if iran:
+        ports = st.get("ports", [])
+        s.append(stat("Forwarded ports", len(ports), esc(", ".join(str(p["port"]) for p in ports[:8]))))
+    else:
+        s.append(stat("Tunnels", len(st["transports"]), ""))
+    rows = "".join(
+        f"<tr><td><b>{esc(t['id'])}</b></td><td class=mu>{esc(tdesc(t))}</td><td class=mono>{t['port']}</td>"
+        f"<td>{encpill(t)}</td><td>{pill(pr.get(t['id'], 'down'), tp=t['id'])}</td></tr>"
+        for t in st["transports"])
+    health = card("Transport health",
+                  "<div class=scroll><table class=tbl><tr><th>Tunnel</th><th>Type</th><th>Port</th><th>Data</th>"
+                  f"<th>State</th></tr>{rows}</table></div>")
+    wg = wg_age(st)
+    info = ("<dl class=kv><dt>Role</dt><dd>" + ("Iran (entry)" if iran else "Foreign (exit)") + "</dd>"
+            f"<dt>Foreign IP</dt><dd class=mono>{esc(st.get('foreign_ip', '-'))}</dd>"
+            f"<dt>Iran IP</dt><dd class=mono>{esc(st.get('iran_ip', '-'))}</dd>"
+            f"<dt>Mode</dt><dd>{MODE_LABEL.get(st.get('strategy', 'fifo'), 'Failover')}</dd>"
+            + (f"<dt>WireGuard handshake</dt><dd id=wg>{esc(wg)}</dd>" if wg else "")
+            + f"<dt>Version</dt><dd class=mono>v{VERSION}</dd></dl>")
+    q = "<div class=row>" + form({"a": "restart"}, "<button class='btn g'>Restart tunnel services</button>")
+    if iran:
+        q += form({"a": "test", "full": "0"}, "<button class=btn>Quick connection test</button>")
+    q += "<button type=button class='btn g' data-tab=logs>View logs</button></div>"
+    return (render_wiz_result() + f"<div class=grid>{''.join(s)}</div>" + health
+            + "<div class=grid style='grid-template-columns:repeat(auto-fit,minmax(300px,1fr))'>"
+            + card("Server", info) + card("Quick actions", q) + "</div>")
+
+
+def render_transports(st, pr):
     rows = ""
     for i, t in enumerate(st["transports"]):
-        s = pr[t["id"]]
-        rows += (f"<tr><td><input type=checkbox name='en_{t['id']}' {'checked' if t['enabled'] else ''}></td>"
-                 f"<td><input name='pr_{t['id']}' value='{i + 1}' size=2></td>"
-                 f"<td><b>{esc(t['id'])}</b></td><td>{esc(desc(t))}</td>"
-                 f"<td>{t['port']}</td><td class={s}>{s}</td></tr>")
+        rows += (f"<tr><td><label class=sw><input type=checkbox name='en_{t['id']}' "
+                 f"{'checked' if t['enabled'] else ''}><i></i></label></td>"
+                 f"<td><input class=w-xs name='pr_{t['id']}' value='{i + 1}' inputmode=decimal></td>"
+                 f"<td><b>{esc(t['id'])}</b></td><td class=mu>{esc(tdesc(t))}</td><td class=mono>{t['port']}</td>"
+                 f"<td>{encpill(t)}</td><td>{pill(pr.get(t['id'], 'down'), tp=t['id'])}</td></tr>")
     strat = "".join(f"<option value={v} {'selected' if st.get('strategy') == v else ''}>{l}</option>"
                     for v, l in (("fifo", "Failover (priority order)"),
                                  ("round", "Rotate (round-robin per connection)"),
                                  ("rand", "Random per connection")))
-    o = [f"<!doctype html><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'>"
-         + ("<meta http-equiv=refresh content='4;url=./'>" if BENCH_STATE["running"] else "") +
-         f"<title>night-tunnel</title><style>{CSS}</style><div class=w>"
-         f"<h1>night-tunnel <small style='color:#8b949e'>({st['role']} &middot; v{VERSION})</small></h1>"
-         f"<div>Engine: <b class={'up' if svc == 'active' else 'down'}>{svc}</b></div>"]
-    if msg:
-        bad = msg.startswith(ERR)
-        o.append(f"<div class='m{' e' if bad else ''}'>{esc(msg.lstrip(ERR))}</div>")
-    o.append("<div class=card><h2 style='margin-top:0'>Transport pool</h2><form method=post action='api'>"
-             "<input type=hidden name=a value=save><table><tr><th>On</th><th>Prio</th><th>ID</th>"
-             "<th>Type</th><th>Port</th><th>State</th></tr>" + rows + "</table>"
-             f"<p>Mode: <select name=strategy>{strat}</select> <button>Save &amp; apply</button></p></form></div>")
-    o.append("<div class=card><h2 style='margin-top:0'>Presets</h2>"
-             + form({"a": "preset"}, "<button name=n value=balanced>Balanced + backup</button> "
-                    "<button name=n value=stealth>Stealth</button> <button name=n value=game>Gaming (UDP first)</button> "
-                    "<button name=n value=rotate>Rotate everything</button>") + "</div>")
-    o.append(render_security(st))
-    if iran:
-        prow = ""
+    pool = card("Transport pool",
+                form({"a": "save"},
+                     "<div class=scroll><table class=tbl><tr><th>On</th><th>Priority</th><th>ID</th><th>Type</th>"
+                     f"<th>Port</th><th>Data</th><th>State</th></tr>{rows}</table></div>"
+                     "<div class=row style='margin-top:14px'>"
+                     + fld("Mode", f"<select name=strategy>{strat}</select>")
+                     + "<button class=btn>Save &amp; apply</button></div>"),
+                "Turn transports on or off and set their order. Lower priority number = tried first.")
+    pre = card("Presets", form({"a": "preset"},
+               "<div class=presets>"
+               "<button class=preset name=n value=balanced><b>Balanced</b><small>Mixed transports with a backup</small></button>"
+               "<button class=preset name=n value=stealth><b>Stealth</b><small>Looks like normal TLS / web traffic</small></button>"
+               "<button class=preset name=n value=game><b>Gaming</b><small>UDP transports first</small></button>"
+               "<button class=preset name=n value=rotate><b>Rotate</b><small>Spread connections over everything</small></button>"
+               "</div>"), "One click re-orders and enables a sensible set.")
+    return pool + pre
 
-        def vsel(cur):
-            return ("<select name=via><option value=pool>relay pool</option>" + "".join(
-                f"<option value={k} {'selected' if cur == k else ''}>kernel: {CARRIERS[k][0]}</option>"
-                for k in (st.get("l3") or {})) + "</select>")
-        for p in st.get("ports", []):
-            sel = "".join(f"<option {'selected' if p['proto'] == x else ''}>{x}</option>" for x in ("tcp", "udp", "both"))
-            prow += ("<tr><td colspan=2>" + form({"a": "editport", "old": p["port"]},
-                     f"<input name=port value={p['port']} size=6> <select name=proto>{sel}</select> "
-                     f"remote <input name=target value='{p.get('target', '')}' placeholder='same' size=6> "
-                     f"path {vsel(p.get('via', ''))} <button>Save</button>")
-                     + "</td><td>" + form({"a": "delport", "port": p["port"]}, "<button class=d>Delete</button>",
-                                          confirm="Delete this port?") + "</td></tr>")
-        addf = form({"a": "addport"},
-                    "<p>Add: <input name=port placeholder=port size=7> <select name=proto><option>tcp</option>"
-                    "<option>udp</option><option>both</option></select> remote <input name=target placeholder=same size=6> "
-                    f"path {vsel('')} <button>Add</button></p>", style="display:block")
-        o.append("<div class=card><h2 style='margin-top:0'>Forwarded ports (Iran &rarr; foreign 127.0.0.1)</h2>"
-                 f"<table>{prow}</table>" + addf + "</div>")
-        o.append("<div class=card><h2 style='margin-top:0'>Sync token (after changes on the foreign server)</h2>"
-                 + form({"a": "importtoken"}, "<textarea name=token placeholder='NT1:...'></textarea><p><button>Import token</button></p>",
-                        style="display:block") + "</div>")
+
+def render_ports(st):
+    items = ""
+    for p in st.get("ports", []):
+        sel = "".join(f"<option {'selected' if p['proto'] == x else ''}>{x}</option>" for x in ("tcp", "udp", "both"))
+        items += ("<div class=item>"
+                  + form({"a": "editport", "old": p["port"]},
+                         fld("Port", f"<input name=port value={p['port']} class=w-s>")
+                         + fld("Protocol", f"<select name=proto>{sel}</select>")
+                         + fld("Remote port", f"<input name=target value='{esc(p.get('target', ''))}' placeholder=same class=w-s>")
+                         + fld("Path", vsel(st, p.get("via", "")))
+                         + "<button class='btn g'>Save</button>", cls="row")
+                  + form({"a": "delport", "port": p["port"]}, "<button class='btn d s'>Delete</button>",
+                         confirm="Delete this port?")
+                  + "</div>")
+    if not items:
+        items = "<p class=hint>No forwarded ports yet.</p>"
+    add = form({"a": "addport"},
+               fld("Port", "<input name=port placeholder=443 class=w-s>")
+               + fld("Protocol", "<select name=proto><option>tcp</option><option>udp</option><option>both</option></select>")
+               + fld("Remote port", "<input name=target placeholder=same class=w-s>")
+               + fld("Path", vsel(st, "")) + "<button class=btn>Add port</button>", cls="row")
+    return (card("Forwarded ports", items, "Each port on this server goes to 127.0.0.1 on the foreign server.")
+            + card("Add a port", add))
+
+
+def render_tunnels(st):
+    items = ""
+    for t in st["transports"]:
+        tt = ttype(t)
+        f = ""
+        if t["via"] == "direct":
+            topts = "".join(f"<option {'selected' if k == tt else ''}>{k}</option>" for k in CATALOG)
+            f += fld("Type", f"<select name=new_type>{topts}</select>")
+        f += fld("Port", f"<input name=port value={t['port']} class=w-s>")
+        if t["via"] == "direct" and tt in TLS_DIALERS:
+            f += fld("SNI", f"<input name=sni value='{esc(t.get('sni', ''))}' placeholder=global class=w-m>")
+        if t["via"] == "direct" and tt in WS_TYPES:
+            f += (fld("Path", f"<input name=path value='{esc(t.get('path', ''))}' placeholder=/ws class=w-s>")
+                  + fld("Host", f"<input name=host value='{esc(t.get('host', ''))}' class=w-m>"))
+        items += ("<div class=item><div class=hd><b>" + esc(t["id"]) + "</b>" + encpill(t)
+                  + f"<span class=mu>{esc(tdesc(t))}</span></div>"
+                  + form({"a": "tpedit", "id": t["id"]}, f + "<button class='btn g'>Save</button>", cls="row")
+                  + form({"a": "tpdel", "id": t["id"]}, "<button class='btn d s'>Delete</button>",
+                         confirm="Delete this tunnel?") + "</div>")
+    og = ""
+    for layer, ids in LAYERS:
+        og += f"<optgroup label='{layer}'>" + "".join(
+            f"<option value={k}>{k} - {CATALOG[k][2] if k in CATALOG else CARRIERS[k][0] + ' (kernel)'}</option>"
+            for k in ids if k in CATALOG or (k in CARRIERS and k not in st.get("l3", {}))) + "</optgroup>"
+    add = form({"a": "tpadd"},
+               fld("Type", f"<select name=id>{og}</select>") + fld("Name", "<input name=name placeholder='same as type' class=w-m>")
+               + fld("Port", "<input name=port placeholder=random class=w-s>") + fld("SNI", "<input name=sni class=w-m>")
+               + fld("Path", "<input name=path class=w-s>") + fld("Host", "<input name=host class=w-m>")
+               + "<button class=btn>Build tunnel</button>", cls="row")
+    return (card("Your tunnels", items, "Change a port, type, SNI, path or host. After any change copy the new token to the Iran server.")
+            + card("Build a new tunnel", add,
+                   "You can build several tunnels of one type (use different names, ports or SNI). "
+                   "Kernel tunnels (L3) can also be used as direct port paths on the Iran server."))
+
+
+def render_token(st):
+    if st["role"] == "foreign":
+        return card("Token for the Iran server",
+                    "<div class=copy><textarea id=tok readonly>" + esc(make_token(st)) + "</textarea></div>"
+                    "<p><button type=button class='btn g s' data-copy='#tok'>Copy</button></p>",
+                    "On the Iran server open Token and import this value (Sync token). Do it after every change here.")
+    return card("Sync token",
+                form({"a": "importtoken"}, "<textarea name=token placeholder='NT1:...'></textarea>"
+                     "<p><button class=btn>Import token</button></p>"),
+                "Paste the token from the foreign server's panel after you change anything there.")
+
+
+def render_bench(st):
+    if st["role"] != "iran":
+        return card("Test tunnels", "", "Run the test from the Iran server's panel (the entry side). "
+                                         "This server answers the test automatically.")
+    body = ""
+    if BENCH_STATE["running"]:
+        last = (BENCH_STATE["log"][-1] if BENCH_STATE["log"] else "starting").lstrip(ERR)
+        body += f"<div class=flash><span class=dot></span><span id=benchlog>{esc(last)}</span></div>"
     else:
-        trows = ""
-        for t in st["transports"]:
-            tt = ttype(t)
-            fields = f"port <input name=port value={t['port']} size=6> "
-            if t["via"] == "direct":
-                topts = "".join(f"<option {'selected' if k == tt else ''}>{k}</option>" for k in CATALOG)
-                fields = f"type <select name=new_type>{topts}</select> " + fields
-                if tt in TLS_DIALERS:
-                    fields += f"SNI <input name=sni value='{esc(t.get('sni', ''))}' placeholder=global size=14> "
-                if tt in WS_TYPES:
-                    fields += (f"path <input name=path value='{esc(t.get('path', ''))}' placeholder=/ws size=8> "
-                               f"host <input name=host value='{esc(t.get('host', ''))}' size=12> ")
-            edit = form({"a": "tpedit", "id": t["id"]}, fields + "<button>Save</button>")
-            dele = form({"a": "tpdel", "id": t["id"]}, "<button class=d>Delete</button>", confirm="Delete this tunnel?")
-            trows += f"<tr><td><b>{esc(t['id'])}</b></td><td>{edit}</td><td>{dele}</td></tr>"
-        og = ""
-        for layer, ids in LAYERS:
-            og += f"<optgroup label='{layer}'>" + "".join(
-                f"<option value={k}>{k} - {CATALOG[k][2] if k in CATALOG else CARRIERS[k][0] + ' (kernel)'}</option>"
-                for k in ids if k in CATALOG or (k in CARRIERS and k not in st.get('l3', {}))) + "</optgroup>"
-        add = form({"a": "tpadd"}, f"type <select name=id>{og}</select> name <input name=name placeholder='same as type' size=12> "
-                   "port <input name=port placeholder=random size=6> SNI <input name=sni size=12> "
-                   "path <input name=path size=7> host <input name=host size=10> <button>Build tunnel</button>",
-                   style="display:block")
-        o.append(f"<div class=card><h2 style='margin-top:0'>Tunnels: edit / delete / build</h2><table>{trows}</table>"
-                 f"<h2>Build a new tunnel</h2>{add}"
-                 "<p style='color:#8b949e'>You can build several tunnels of one type (give them different names / ports / SNI). "
-                 "Kernel tunnels (L3) are also usable as direct port paths on the Iran server. "
-                 "After any change, copy the token below to the Iran server (Sync token).</p></div>")
-        o.append("<div class=card><h2 style='margin-top:0'>Token for the Iran server</h2>"
-                 f"<textarea readonly>{esc(make_token(st))}</textarea></div>")
-    o.append(render_bench(st))
-    o.append(render_wiz_result())
-    o.append(render_tg(st))
-    o.append(render_update(st))
-    o.append("<div class=card><h2 style='margin-top:0'>Maintenance</h2>"
-             + form({"a": "checkver"}, "<button>Check for update</button>") + " "
-             + form({"a": "update_script"}, "<button>Update night-tunnel</button>", confirm="Update the script?") + " "
-             + form({"a": "update_gost"}, "<button>Update engine (gost)</button>", confirm="Update gost?") + " "
-             + form({"a": "restart"}, "<button>Restart tunnel</button>") + " "
-             + "<form method=post action='logout' style='display:inline'><button class=d>Logout</button></form></div>")
-    o.append("<div class=card style='border-color:#8b1a1a'><h2 style='margin-top:0;color:#f85149'>Danger zone</h2>"
-             "<p style='color:#8b949e'>Type <b>DELETE</b> to confirm.</p>"
-             + form({"a": "reset"}, "<input name=confirm size=8> <button class=d>Delete tunnel config (keep installed)</button>", style="display:block;margin-bottom:10px")
-             + form({"a": "uninstall"}, "<input name=confirm size=8> <label><input type=checkbox name=purge> also remove gost binary</label> "
-                    "<button class=d>Uninstall night-tunnel completely</button>", style="display:block") + "</div></div>")
-    return "".join(o)
+        err = next((x for x in reversed(BENCH_STATE["log"]) if x.startswith(ERR)), "")
+        if err:
+            body += f"<div class='flash e'>{esc(err.lstrip(ERR))}</div>"
+        body += ("<div class=row>" + form({"a": "test", "full": "1"}, "<button class=btn>Full test (connect + speed)</button>")
+                 + form({"a": "test", "full": "0"}, "<button class='btn g'>Quick test (connect + latency)</button>") + "</div>")
+    try:
+        with open(BENCH) as f:
+            rep = json.load(f)
+    except (OSError, ValueError):
+        return card("Test tunnels", body, "Speed tests use real bandwidth for about 10 seconds per tunnel.")
+    rows = ""
+    for r in sorted(rep["results"], key=lambda r: -r.get("score", 0)):
+        if r["ok"]:
+            openp = r.get("auth") == "OPEN"
+            rows += (f"<tr><td><b>{esc(r['name'])}</b></td><td class=mu>{esc(r['layer'])}</td><td>{pill('up')}</td>"
+                     f"<td>{r['rtt']}</td><td>{r['jitter']}</td><td>{int(r['loss'] * 100)}%</td>"
+                     f"<td>{r.get('down', '-')}</td><td>{r.get('up', '-')}</td><td>{esc(r.get('enc', '-'))}</td>"
+                     f"<td><span class='pill {'down' if openp else 'up'}'>{esc(r.get('auth', '-'))}</span></td>"
+                     f"<td><b>{r.get('score', '-')}</b></td></tr>")
+        else:
+            rows += (f"<tr><td><b>{esc(r['name'])}</b></td><td class=mu>{esc(r['layer'])}</td><td>{pill('down')}</td>"
+                     f"<td colspan=8 class=mu>{esc(r.get('err', ''))}</td></tr>")
+    when = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(rep["ts"]))
+    body += (f"<p class=hint><span>Last run</span>: {when}</p><div class=scroll><table class=tbl><tr><th>Tunnel</th><th>Layer</th>"
+             "<th>State</th><th>RTT ms</th><th>Jitter</th><th>Loss</th><th>Down Mb/s</th><th>Up Mb/s</th>"
+             f"<th>Encrypted</th><th>Password</th><th>Score</th></tr>{rows}</table></div>")
+    out = card("Test tunnels", body)
+    rec = "<ul class=rec>" + "".join(f"<li>{esc(x)}</li>" for x in rep["rec"]["lines"]) + "</ul>"
+    if rep["rec"]["order"] and not BENCH_STATE["running"]:
+        rec += form({"a": "benchapply"}, "<p><button class=btn>Apply suggested order</button></p>",
+                    confirm="Enable only the working tunnels in the suggested order?")
+    return out + card("Recommendation", rec)
+
+
+def render_security(st):
+    if is_secure(st):
+        txt = ("<span class='pill up'>With password</span><p>Relay login is required. TLS / QUIC / WireGuard tunnels are "
+               "encrypted. Plain tunnels (tcp, ws, kcp, udp, ...) are authenticated but carry data unencrypted.</p>")
+    else:
+        txt = ("<span class='pill udp'>No password</span><p class=mu>No relay login. The foreign server only accepts the "
+               f"Iran server's IP (<span class=mono>{esc(st['iran_ip'])}</span>); plain tunnels carry data unencrypted.</p>")
+    if st["role"] == "foreign":
+        txt += form({"a": "security", "mode": "open" if is_secure(st) else "password"},
+                    "<button class='btn g'>" + ("Switch to NO password" if is_secure(st) else "Switch to password mode")
+                    + "</button>", confirm="Change the security mode? Then copy the new token to the Iran server.")
+    else:
+        txt += "<p class=hint>Change it on the foreign server, then Sync token here.</p>"
+    return card("Security mode", txt)
+
+
+def render_tg(st):
+    t = tg_status()
+    if t:
+        ok = t["active"]
+        body = ("<dl class=kv><dt>State</dt><dd>" + pill(ok, svc="tg") + f"</dd><dt>Port</dt><dd class=mono>{t['port']}</dd>"
+                f"<dt>Cover domain</dt><dd class=mono>{esc(t['host'])}</dd></dl>"
+                "<div style='margin-top:16px;display:grid;gap:10px'>"
+                f"<div class=copy><input id=tglink readonly value='{esc(t['links']['https'])}'>"
+                "<button type=button class='btn g s' data-copy='#tglink'>Copy</button></div>"
+                f"<div class=copy><input id=tglink2 readonly value='{esc(t['links']['tg'])}'>"
+                "<button type=button class='btn g s' data-copy='#tglink2'>Copy</button></div></div>"
+                "<div class=row style='margin-top:16px'>"
+                + form({"a": "tgrestart"}, "<button class='btn g'>Restart</button>")
+                + form({"a": "tgrotate"}, "<button class='btn g'>New secret</button>",
+                       confirm="Old links will stop working. Continue?")
+                + "<button type=button class='btn g' data-gologs=tg>View logs</button>"
+                + form({"a": "tgremove"}, "<button class='btn d'>Remove proxy</button>",
+                       confirm="Remove the Telegram proxy?") + "</div>")
+        edit = form({"a": "tgedit"},
+                    fld("Port", f"<input name=port value={t['port']} class=w-s>")
+                    + fld("Cover domain", f"<input name=host value='{esc(t['host'])}' class=w-l>")
+                    + "<button class=btn>Apply</button>", cls="row")
+        return (card("Telegram proxy (MTProto, fake-TLS)", body,
+                     "Runs on this server, independent of the tunnels. Share the link with people who need it.")
+                + card("Change port or cover domain", edit, "The secret is regenerated, so share the new link afterwards."))
+    ip = st["panel"].get("host", "")
+    ip = ip if valid_ip(ip) else ""
+    create = form({"a": "tgcreate"},
+                  fld("Server IP", f"<input name=ip value='{esc(ip)}' class=w-m placeholder='203.0.113.10'>")
+                  + fld("Port", "<input name=port value=443 class=w-s>")
+                  + fld("Cover domain", "<input name=host value='www.microsoft.com' class=w-l>")
+                  + "<button class=btn>Create proxy</button>", cls="row")
+    return card("Telegram proxy (MTProto, fake-TLS)", create,
+                "Runs on this server, independent of the tunnels. Use a server that can reach Telegram "
+                "(usually the foreign one). You get a link to share.")
+
+
+def render_logs():
+    segs = "".join(f"<button type=button class=seg data-log={k}>{l}</button>"
+                   for k, l in (("gost", "Engine"), ("l3", "Kernel links"), ("panel", "Panel"), ("tg", "Telegram")))
+    return card("Logs", f"<div class=row>{segs}<span class=grow></span>"
+                "<select id=logn><option>50</option><option selected>100</option><option>300</option></select>"
+                "<button type=button class='btn g s' data-reload=1>Refresh</button></div><pre class=log id=logbox></pre>",
+                "Latest lines from the systemd journal.")
+
+
+def render_update(st):
+    f = st["role"] == "foreign"
+    return card("Update tunnel settings",
+                form({"a": "updtunnel"},
+                     fld("Foreign IP", f"<input name=foreign_ip value='{esc(st['foreign_ip'])}' class=w-m>")
+                     + fld("Iran IP", f"<input name=iran_ip value='{esc(st['iran_ip'])}' class=w-m>")
+                     + fld("SNI", f"<input name=sni value='{esc(st.get('sni', ''))}' class=w-m>")
+                     + ("<label class=ck><input type=checkbox name=rotate> Rotate credentials + WireGuard keys</label>" if f else "")
+                     + "<button class=btn>Update tunnel</button>", cls="row"),
+                "Use it after getting a new server IP or to rotate keys. "
+                + ("Then copy the new token to the Iran server." if f else "Make the same change on the foreign server, then Sync token."))
+
+
+def render_system(st):
+    new = st["role"] == "new"
+    cc = sh("sysctl -n net.ipv4.tcp_congestion_control").stdout.strip() or "?"
+    bbr_on = cc == "bbr"
+    o = ""
+    if not new:
+        o += render_update(st)
+    o += card("Network speed (BBR)",
+              f"<p><span>Current congestion control</span>: <b class=mono>{esc(cc)}</b> " + ("<span class='pill up'>BBR on</span>" if bbr_on else "") + "</p>"
+              + ("" if bbr_on else form({"a": "bbr"}, "<button class=btn>Enable BBR</button>")),
+              "BBR usually gives better throughput on long, lossy links.")
+    o += card("Panel password",
+              form({"a": "chpw"}, fld("New password", "<input type=password name=pw1 autocomplete=new-password class=w-m>")
+                   + fld("Repeat", "<input type=password name=pw2 autocomplete=new-password class=w-m>")
+                   + "<button class=btn>Change password</button>", cls="row"),
+              "At least 8 characters. The panel login user stays the same.")
+    m = ("<div class=row>" + form({"a": "checkver"}, "<button class='btn g'>Check for update</button>")
+         + form({"a": "update_script"}, "<button class='btn g'>Update night-tunnel</button>", confirm="Update the script?")
+         + form({"a": "update_gost"}, "<button class='btn g'>Update engine (gost)</button>", confirm="Update gost?")
+         + ("" if new else form({"a": "restart"}, "<button class='btn g'>Restart tunnel</button>")) + "</div>")
+    o += card("Maintenance", m, f"<span>Installed version</span> <span class=mono>v{VERSION}</span>")
+    if not new:
+        o += card("Danger zone",
+                  form({"a": "reset"}, "<input name=confirm placeholder=DELETE class=w-s> "
+                       "<button class='btn d'>Delete tunnel config (keep installed)</button>", cls="row")
+                  + "<div style='height:12px'></div>"
+                  + form({"a": "uninstall"}, "<input name=confirm placeholder=DELETE class=w-s> "
+                         "<label class=ck><input type=checkbox name=purge> also remove gost binary</label> "
+                         "<button class='btn d'>Uninstall night-tunnel completely</button>", cls="row"),
+                  "Type DELETE to confirm.", cls="bad")
+    return o
+
+
+def render_wiz_result():
+    r = WIZ.get("result")
+    if not r:
+        return ""
+    o = r["other_panel"]
+    h = (f"<p>Forwarded ports: <b class=mono>{esc(', '.join(map(str, r['ports'])))}</b> (Iran &rarr; foreign 127.0.0.1:port)</p>"
+         "<dl class=kv><dt>Other server's panel</dt>"
+         f"<dd class=mono>{esc(o['panel_url'])}</dd><dt>User</dt><dd class=mono>{esc(o['user'])}</dd>"
+         f"<dt>Password</dt><dd class=mono>{esc(o['pw'])}</dd></dl>"
+         "<p class=hint>Shown once - save it now.</p>")
+    if r.get("test"):
+        h += f"<pre class=log>{esc(r['test'])}</pre>"
+    return card("Easy setup finished", h + form({"a": "wizclear"}, "<p><button class='btn g'>Dismiss</button></p>"), cls="ok")
+
+
+def render_setup():
+    run = WIZ["running"]
+    o = ""
+    if WIZ["error"] and not run:
+        o += f"<div class='flash e'>{esc(WIZ['error'])}</div>"
+    if run:
+        o += card("Setting up...", "<pre class=log id=wizlog>" + esc("\n".join(WIZ["log"])) + "</pre>",
+                  "This page updates by itself. It can take a few minutes.")
+    else:
+        f = form({"a": "wizard"},
+                 "<div class=row>" + fld("This server is the", "<select name=role><option value=iran>Iran (entry) server</option>"
+                                         "<option value=foreign>foreign (exit) server</option></select>")
+                 + fld("IP of the OTHER server", "<input name=remote_ip class=w-m placeholder='203.0.113.10'>") + "</div>"
+                 "<div class=row style='margin-top:12px'>" + fld("SSH port", "<input name=ssh_port value=22 class=w-s>")
+                 + fld("SSH user", "<input name=ssh_user value=root class=w-m>")
+                 + fld("SSH password of the other server", "<input type=password name=ssh_pass autocomplete=off class=w-l>")
+                 + fld("or SSH key file on this server", "<input name=ssh_key class=w-l placeholder='/root/.ssh/id_ed25519'>") + "</div>"
+                 "<div class=row style='margin-top:12px'>"
+                 + fld("Security", "<select name=mode><option value=password>With password (encrypted, recommended)</option>"
+                       "<option value=open>No password (limited to the Iran IP)</option></select>")
+                 + fld("Ports to forward on the Iran server", "<input name=ports value=443 class=w-m placeholder='443,2053'>")
+                 + fld("Ports that also need UDP (optional)", "<input name=udp class=w-m>") + "</div>"
+                 "<p><label class=ck><input type=checkbox name=force> Overwrite an existing night-tunnel config on the other server</label></p>"
+                 "<p><button class=btn>Build the tunnel automatically</button></p>")
+        o += card("Easy setup", f,
+                  "Give the other server's IP and root SSH login. This server installs night-tunnel there, creates both "
+                  "sides of the tunnel and runs a first test. The SSH password is used once and not stored.")
+    return render_wiz_result() + o
+
+
+# ---- page shell
+def tabs_for(st):
+    if st["role"] == "new":
+        return [("setup", "Easy setup", "wand"), ("telegram", "Telegram proxy", "send"),
+                ("logs", "Logs", "terminal"), ("system", "System", "settings")]
+    t = [("overview", "Overview", "home"), ("transports", "Transports", "layers")]
+    t.append(("ports", "Ports", "swap") if st["role"] == "iran" else ("tunnels", "Tunnels", "tunnel"))
+    return t + [("token", "Token", "key"), ("test", "Test", "gauge"), ("telegram", "Telegram proxy", "send"),
+                ("security", "Security", "shield"), ("logs", "Logs", "terminal"), ("system", "System", "settings")]
+
+
+def render_page(st, msg=""):
+    new = st["role"] == "new"
+    states = svc_states()
+    pr = {} if new else probe_all(st)
+    secs = {"setup": render_setup, "telegram": lambda: render_tg(st), "logs": render_logs,
+            "system": lambda: render_system(st)}
+    if not new:
+        secs.update({"overview": lambda: render_overview(st, states, pr), "transports": lambda: render_transports(st, pr),
+                     "ports": lambda: render_ports(st), "tunnels": lambda: render_tunnels(st),
+                     "token": lambda: render_token(st), "test": lambda: render_bench(st),
+                     "security": lambda: render_security(st)})
+    tabs = tabs_for(st)
+    nav = "".join(f"<button type=button class=nav-i data-tab={k}>{ico(i)}<span>{lbl}</span></button>" for k, lbl, i in tabs)
+    body = "".join(f"<section class=tab id=tab-{k}>{secs[k]()}</section>" for k, _, _ in tabs)
+    role = {"iran": "Iran &middot; entry", "foreign": "Foreign &middot; exit", "new": "Not configured"}[st["role"]]
+    flash = ""
+    if msg:
+        flash = f"<div class='flash{' e' if msg.startswith(ERR) else ''}'>{esc(msg.lstrip(ERR))}</div>"
+    run = "1" if (BENCH_STATE["running"] or WIZ["running"]) else "0"
+    return (f"<!doctype html><html><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'>"
+            f"<title>night-tunnel</title><style>{CSS}</style><body data-run={run}><div class=app>"
+            f"<aside class=side><div class=brand><div class=logo>{MOON}</div><span>night-tunnel</span></div>{nav}</aside>"
+            f"<main class=main><div class=top><h1 id=ttl></h1><span class='pill plain'>{role}</span>"
+            f"<span class='pill plain mono'>v{VERSION}</span><span class=grow></span>"
+            "<button type=button class='btn g s' id=lang>&#1601;&#1575;&#1585;&#1587;&#1740;</button>"
+            "<form method=post action=logout><button class='btn g s'>Logout</button></form></div>"
+            f"{flash}{body}</main></div><script>{JS}</script>")
+
+
+def login_page(err=""):
+    e = f"<div class='flash e'>{esc(err)}</div>" if err else ""
+    return (f"<!doctype html><html><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'>"
+            f"<title>night-tunnel</title><style>{CSS}</style><body><div class=login><div class=card>"
+            f"<div class=logo>{MOON}</div><h1>night-tunnel</h1><div class=mu>Sign in to the control panel</div>{e}"
+            "<form method=post action=login><input name=u placeholder=user autocomplete=username autofocus>"
+            "<input name=p type=password placeholder=password autocomplete=current-password>"
+            "<button class=btn>Login</button></form></div></div>")
 
 
 def load_any():
@@ -1717,107 +2343,18 @@ def wiz_bg(p):
         WIZ["running"] = False
 
 
-def render_security(st):
-    h = "<div class=card><h2 style='margin-top:0'>Security mode</h2>"
-    if is_secure(st):
-        h += ("<p><b class=up>With password</b>: relay login required; TLS / QUIC / WireGuard tunnels are encrypted. "
-              "Plain tunnels (tcp, ws, kcp, udp, ...) are authenticated but carry data unencrypted.</p>")
-    else:
-        h += ("<p><b class=udp>No password</b>: no relay login. The foreign server only accepts the Iran server's IP "
-              f"({esc(st['iran_ip'])}); plain tunnels carry data unencrypted.</p>")
-    if st["role"] == "foreign":
-        h += form({"a": "security", "mode": "open" if is_secure(st) else "password"},
-                  "<button>" + ("Switch to NO password" if is_secure(st) else "Switch to password mode") + "</button>",
-                  confirm="Change the security mode? Then copy the new token to the Iran server.")
-    else:
-        h += "<p style='color:#8b949e'>Change it on the foreign server, then Sync token here.</p>"
-    return h + "</div>"
-
-
-def render_tg(st):
-    h = "<div class=card><h2 style='margin-top:0'>Telegram proxy (MTProto, fake-TLS)</h2>"
-    t = tg_status()
-    if t:
-        h += (f"<p>State: <b class={'up' if t['active'] == 'active' else 'down'}>{esc(t['active'])}</b> &middot; "
-              f"port {t['port']} &middot; cover domain {esc(t['host'])}</p>"
-              f"<p><a style='color:#9db4ff' href='{esc(t['links']['https'])}'>{esc(t['links']['https'])}</a></p>"
-              f"<textarea readonly style='height:60px'>{esc(t['links']['tg'])}</textarea><p>"
-              + form({"a": "tgrotate"}, "<button>New secret</button>", confirm="Old links will stop working. Continue?")
-              + " " + form({"a": "tgremove"}, "<button class=d>Remove proxy</button>", confirm="Remove the Telegram proxy?")
-              + "</p>")
-    else:
-        ip = st["panel"].get("host", "")
-        ip = ip if valid_ip(ip) else ""
-        h += (form({"a": "tgcreate"},
-                   f"server IP <input name=ip value='{esc(ip)}' size=15> port <input name=port value=443 size=5> "
-                   "cover domain <input name=host value='www.microsoft.com' size=18> <button>Create proxy</button>",
-                   style="display:block")
-              + "<p style='color:#8b949e'>Runs on this server, independent of the tunnels. Use a server that can "
-                "reach Telegram. You get a link to share.</p>")
-    return h + "</div>"
-
-
-def render_wiz_result():
-    r = WIZ.get("result")
-    if not r:
-        return ""
-    o = r["other_panel"]
-    h = ("<div class=card style='border-color:#238636'><h2 style='margin-top:0;color:#3fb950'>Easy setup finished</h2>"
-         f"<p>Forwarded ports: {esc(', '.join(map(str, r['ports'])))} (Iran &rarr; foreign 127.0.0.1:port)</p>"
-         f"<p>Other server's panel: <b>{esc(o['panel_url'])}</b><br>user <b>{esc(o['user'])}</b> "
-         f"password <b>{esc(o['pw'])}</b> <span style='color:#8b949e'>(shown once &mdash; save it)</span></p>")
-    if r.get("test"):
-        h += f"<pre style='overflow:auto'>{esc(r['test'])}</pre>"
-    return h + form({"a": "wizclear"}, "<button>Dismiss</button>") + "</div>"
-
-
-def render_wizard(st, msg=""):
-    run = WIZ["running"]
-    o = ["<!doctype html><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'>"
-         + ("<meta http-equiv=refresh content='4;url=./'>" if run else "")
-         + f"<title>night-tunnel</title><style>{CSS}</style><div class=w><h1>night-tunnel "
-           f"<small style='color:#8b949e'>(setup &middot; v{VERSION})</small></h1>"]
-    if msg:
-        bad = msg.startswith(ERR)
-        o.append(f"<div class='m{' e' if bad else ''}'>{esc(msg.lstrip(ERR))}</div>")
-    if WIZ["error"] and not run:
-        o.append(f"<div class='m e'>{esc(WIZ['error'])}</div>")
-    if run:
-        o.append("<div class=card><h2 style='margin-top:0'>Setting up...</h2><pre>" + esc("\n".join(WIZ["log"]))
-                 + "</pre><p style='color:#8b949e'>This page refreshes by itself. It can take a few minutes.</p></div>")
-    else:
-        fld = "style='width:100%;max-width:340px'"
-        f = form({"a": "wizard"},
-                 "<p>This server is the <select name=role><option value=iran>Iran (entry) server</option>"
-                 "<option value=foreign>foreign (exit) server</option></select></p>"
-                 f"<p>IP of the OTHER server<br><input name=remote_ip {fld} placeholder='203.0.113.10'></p>"
-                 f"<p>SSH port <input name=ssh_port value=22 size=5> user <input name=ssh_user value=root size=10></p>"
-                 f"<p>SSH password of the other server<br><input type=password name=ssh_pass {fld} autocomplete=off></p>"
-                 f"<p>or SSH key file on this server<br><input name=ssh_key {fld} placeholder='/root/.ssh/id_ed25519'></p>"
-                 "<p>Security <select name=mode><option value=password>With password (encrypted, recommended)</option>"
-                 "<option value=open>No password (limited to the Iran IP)</option></select></p>"
-                 f"<p>Ports to forward on the Iran server<br><input name=ports {fld} value=443 placeholder='443,2053'></p>"
-                 f"<p>Ports that also need UDP (optional)<br><input name=udp {fld}></p>"
-                 "<p><label><input type=checkbox name=force> overwrite an existing night-tunnel config on the other server</label></p>"
-                 "<p><button>Build the tunnel automatically</button></p>", style="display:block")
-        o.append("<div class=card><h2 style='margin-top:0'>Easy setup</h2>"
-                 "<p>Give the other server's IP and root SSH login. This server installs night-tunnel there, "
-                 "creates both sides of the tunnel and runs a first test. The SSH password is used once and not stored.</p>"
-                 + f + "</div>")
-    o.append(render_wiz_result())
-    o.append(render_tg(st))
-    o.append("<form method=post action='logout'><button class=d>Logout</button></form></div>")
-    return "".join(o)
-
-
-def render_page(st, msg=""):
-    return render_wizard(st, msg) if st["role"] == "new" else render_dash(st, msg)
-
-
 def tg_act(a, f):
     """Telegram-proxy panel actions (work with or without a tunnel). Returns a message or None."""
     if a == "tgcreate":
         return op_tg_create(f.get("ip", ""), f.get("port", "443"), f.get("host", ""))
+    if a == "tgedit":
+        t = tg_load()
+        if not t:
+            return ERR + "No Telegram proxy yet."
+        return op_tg_create(t["ip"], f.get("port", "").strip() or str(t["port"]), f.get("host", "").strip() or t["host"])
+    if a == "tgrestart":
+        sh("systemctl restart night-tunnel-tg")
+        return "Restarted."
     if a == "tgrotate":
         return op_tg_rotate()
     if a == "tgremove":
@@ -1825,11 +2362,52 @@ def tg_act(a, f):
     return None
 
 
+def op_panel_pw(st, pw, pw2):
+    if len(pw) < 8:
+        return ERR + "The password must be at least 8 characters."
+    if pw != pw2:
+        return ERR + "The two passwords do not match."
+    p = st["panel"]
+    p["salt"] = secrets.token_hex(16)
+    p["pass_hash"] = hash_pw(pw, p["salt"])
+    if st["role"] == "new":
+        boot = _boot_panel() or {"le": ""}
+        boot["panel"] = p
+        _write_boot(boot)
+    else:
+        save(st)
+    return "Panel password changed."
+
+
+def sys_act(st, a, f):
+    """Panel actions that work in every state (with or without a tunnel). Returns a message or None."""
+    if a == "wizclear":
+        WIZ["result"] = None
+        return ""
+    if a == "chpw":
+        return op_panel_pw(st, f.get("pw1", ""), f.get("pw2", ""))
+    if a == "bbr":
+        try:
+            bbr()
+        except Exception as e:
+            return ERR + f"Could not enable BBR: {e}"
+        return "BBR enabled."
+    if a == "checkver":
+        rv = remote_version()
+        return f"Installed v{VERSION}, latest v{rv}." if rv else ERR + "Could not check (no repo URL / no access)."
+    if a == "update_script":
+        return update_script()
+    if a == "update_gost":
+        return update_gost()
+    return tg_act(a, f)
+
+
 class Handler(BaseHTTPRequestHandler):
     timeout = 15
     server_version = "nginx"
     sys_version = ""
     sessions = {}
+    flash = {}
     fails = {}
 
     def log_message(self, *a):
@@ -1842,6 +2420,9 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(b)))
         self.send_header("X-Frame-Options", "DENY")
         self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; "
+                         "script-src 'unsafe-inline'; connect-src 'self'; form-action 'self'; base-uri 'none'; "
+                         "frame-ancestors 'none'")
         for k, v in (extra or {}).items():
             self.send_header(k, v)
         self.end_headers()
@@ -1855,12 +2436,15 @@ class Handler(BaseHTTPRequestHandler):
             return self.path[len(pre):].split("?")[0]
         return None
 
-    def authed(self):
+    def tok(self):
         for part in self.headers.get("Cookie", "").split(";"):
             k, _, v = part.strip().partition("=")
             if k == "nts" and self.sessions.get(v, 0) > time.time():
-                return True
-        return False
+                return v
+        return ""
+
+    def authed(self):
+        return bool(self.tok())
 
     def form(self):
         n = min(int(self.headers.get("Content-Length") or 0), 65536)
@@ -1871,9 +2455,18 @@ class Handler(BaseHTTPRequestHandler):
         s = self.sub(st)
         if s is None:
             return self.reply(404, "Not Found", "text/plain")
+        if self.path == "/" + st["panel"]["path"]:
+            return self.reply(301, "", extra={"Location": self.path + "/"})
+        if s in ("/status", "/logs"):
+            if not self.authed():
+                return self.reply(403, "Forbidden", "text/plain")
+            if s == "/status":
+                return self.reply(200, status_json(st), "application/json")
+            q = parse_qs(urlparse(self.path).query)
+            return self.reply(200, read_logs(q.get("svc", [""])[0], q.get("n", ["100"])[0]), "text/plain; charset=utf-8")
         if s == "/" and self.authed():
-            return self.reply(200, render_page(st))
-        self.reply(200, LOGIN % (CSS, ""))
+            return self.reply(200, render_page(st, self.flash.pop(self.tok(), "")))
+        self.reply(200, login_page())
 
     def do_POST(self):
         st = load_any()
@@ -1892,7 +2485,7 @@ class Handler(BaseHTTPRequestHandler):
             if not ok:
                 self.fails[ip] = (cnt + 1, time.time() + 300)
                 time.sleep(1)
-                return self.reply(200, LOGIN % (CSS, "<p class=down>Wrong credentials</p>"))
+                return self.reply(200, login_page("Wrong credentials"))
             self.fails.pop(ip, None)
             tok = secrets.token_urlsafe(32)
             self.sessions[tok] = time.time() + 6 * 3600
@@ -1901,15 +2494,17 @@ class Handler(BaseHTTPRequestHandler):
         if not self.authed():
             return self.reply(303, "", extra={"Location": "./"})
         if s == "/logout":
+            self.sessions.pop(self.tok(), None)
             return self.reply(303, "", extra={"Location": "./", "Set-Cookie": "nts=; Max-Age=0; Path=/"})
         if s != "/api":
             return self.reply(404, "Not Found", "text/plain")
         msg = self.act(st, f)
         if msg == "BYE":
-            return self.reply(200, "<body style='background:#0d1117;color:#e6edf3;font-family:sans-serif;padding:30px'>"
+            return self.reply(200, "<body style='background:#070b14;color:#e8eef8;font-family:sans-serif;padding:30px'>"
                                    "Removal started. The panel is going offline.")
-        st = load_any()
-        self.reply(200, render_page(st, msg))
+        tab = re.sub(r"[^a-z]", "", f.get("tab", "").lower())[:12]
+        self.flash[self.tok()] = msg
+        self.reply(303, "", extra={"Location": "./" + ("#" + tab if tab else "")})
 
     def act_new(self, f):
         """Actions while no tunnel exists yet (panel started first)."""
@@ -1928,17 +2523,15 @@ class Handler(BaseHTTPRequestHandler):
         if a == "wizclear":
             WIZ["result"] = None
             return ""
-        return tg_act(a, f) or ""
+        return sys_act({"role": "new", "panel": load_any()["panel"]}, a, f) or ""
 
     def act(self, st, f):
         a = f.get("a")
         if st["role"] == "new":
             return self.act_new(f)
-        if a in ("tgcreate", "tgrotate", "tgremove"):
-            return tg_act(a, f)
-        if a == "wizclear":
-            WIZ["result"] = None
-            return ""
+        if a in ("tgcreate", "tgedit", "tgrestart", "tgrotate", "tgremove", "wizclear", "chpw", "bbr",
+                 "checkver", "update_script", "update_gost"):
+            return sys_act(st, a, f)
         if a == "save":
             prio = {}
             for t in st["transports"]:
@@ -1993,15 +2586,8 @@ class Handler(BaseHTTPRequestHandler):
         elif a == "importtoken":
             msg = op_import_token(st, f.get("token", ""))
         elif a == "restart":
-            sh("systemctl restart night-tunnel-l3")
+            sh("systemctl restart night-tunnel-l3 night-tunnel-gost")
             msg = "Restarted."
-        elif a == "checkver":
-            rv = remote_version()
-            return (f"Installed v{VERSION}, latest v{rv}." if rv else ERR + "Could not check (no repo URL / no access).")
-        elif a == "update_script":
-            return update_script()
-        elif a == "update_gost":
-            return update_gost()
         elif a in ("reset", "uninstall"):
             if f.get("confirm") != "DELETE":
                 return ERR + "Type DELETE to confirm."
@@ -2018,6 +2604,8 @@ class Handler(BaseHTTPRequestHandler):
         if not apply(st):
             msg += " (nothing to run: add a port / enable a transport)"
         return msg
+
+
 
 
 def run_panel():
