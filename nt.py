@@ -34,7 +34,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs
 
 NAME = "night-tunnel"
-VERSION = "1.3.0"
+VERSION = "1.3.1"
 BASE = os.environ.get("NT_BASE", "/etc/night-tunnel")
 STATE = BASE + "/state.json"
 GOST_CFG = BASE + "/gost.json"
@@ -2754,34 +2754,61 @@ def easy_menu():
             print(" - " + ln)
 
 
+def _write_boot(boot):
+    os.makedirs(BASE, exist_ok=True)
+    with open(BOOT, "w") as f:
+        json.dump(boot, f)
+    os.chmod(BOOT, 0o600)
+
+
+def panel_report(st, pw):
+    """Show the panel login and verify the panel really answers on its port."""
+    show_panel(st, pw)
+    port = st["panel"]["port"]
+    up = False
+    for _ in range(20):
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=1):
+                up = True
+                break
+        except OSError:
+            time.sleep(0.5)
+    if up:
+        say("The panel is running. Open the URL above in your browser (accept the self-signed certificate "
+            "warning if you did not give a domain).", G)
+        say(f"If it does not open: allow TCP port {port} in your hosting provider's firewall too.", Y)
+    else:
+        say("The panel did not start. Log:", R)
+        print(sh("journalctl -u night-tunnel-panel -n 15 --no-pager").stdout)
+
+
 def panel_init():
-    """Start only the web panel (no tunnel yet) so the whole setup can be done from the browser."""
+    """Create the web panel first (no tunnel yet): everything else is then done from the browser."""
     need_root()
     if os.path.exists(STATE):
-        return say("A tunnel is already configured here; use menu 9 for the panel details.", Y)
+        return say("A tunnel is already configured here; menu 9 shows the panel and resets its password.", Y)
     if _boot_panel():
-        return say("The panel is already running; use menu 9 to see its URL.", Y)
-    domain = ask("Domain pointing to this server (optional, for real SSL)")
+        say("The web panel already exists: making sure it runs and giving you a NEW password.", Y)
+        return reset_panel()
+    domain = ask("Domain for the panel (optional - press Enter to use this server's IP)")
     if domain and not valid_host(domain):
         return say("Invalid domain.", R)
     ip = public_ip() or ask("This server's public IP")
+    if not valid_ip(ip):
+        return say("Invalid IP.", R)
     p, pw = new_panel(domain, ip)
-    os.makedirs(BASE, exist_ok=True)
     boot = {"panel": p, "le": ""}
-
-    def put():
-        with open(BOOT, "w") as f:
-            json.dump(boot, f)
-        os.chmod(BOOT, 0o600)
-    put()
+    _write_boot(boot)
     if make_cert(domain, "localhost"):
         boot["le"] = domain
-        put()
+        _write_boot(boot)
     fw_open(p["port"], "tcp")
     write_units()
-    sh("systemctl enable --now night-tunnel-panel")
-    show_panel({"panel": p}, pw)
-    say("Open the panel in your browser: there you can set up the tunnel, or a Telegram proxy.", G)
+    sh("systemctl enable night-tunnel-panel")
+    sh("systemctl restart night-tunnel-panel")
+    panel_report({"panel": p}, pw)
+    say("In the panel: 'Easy setup' builds the tunnel and installs the other server for you; "
+        "'Telegram proxy' makes a proxy on this server.", G)
 
 
 def show_panel(st, pw=None):
@@ -2793,20 +2820,27 @@ def show_panel(st, pw=None):
 
 
 def reset_panel():
-    st = load()
+    st = load_any()           # works before any tunnel exists (web panel created first)
     pw = rnd(16)
     st["panel"]["salt"] = secrets.token_hex(16)
     st["panel"]["pass_hash"] = hash_pw(pw, st["panel"]["salt"])
-    save(st)
+    if st["role"] == "new":
+        boot = _boot_panel() or {"le": ""}
+        boot["panel"] = st["panel"]
+        _write_boot(boot)
+        write_units()
+        sh("systemctl enable night-tunnel-panel")
+    else:
+        save(st)
     sh("systemctl restart night-tunnel-panel")
-    show_panel(st, pw)
+    panel_report(st, pw)
 
 
 def need_state():
     try:
         return load()
     except (OSError, ValueError):
-        say("Not configured yet: run setup first (1 or 2).", R)
+        say("Not configured yet: create the web panel (16) or run the easy setup (15).", R)
         return None
 
 
@@ -3056,6 +3090,12 @@ def bbr():
 
 
 def menu():
+    if not os.path.exists(STATE) and not _boot_panel():
+        say("No tunnel and no web panel on this server yet.", Y)
+        print("The web panel lets you do everything from the browser, including building the tunnel and\n"
+              "installing the other server automatically.")
+        if ask("Create the web panel now? (y/n)", "y") != "n":
+            panel_init()
     while True:
         say(f"\n=== night-tunnel v{VERSION} ===", G)
         print("1) Setup FOREIGN server (exit)\n2) Setup IRAN server (entry)\n3) Transports (edit / add / delete)"
@@ -3064,7 +3104,7 @@ def menu():
               "\n12) Enable BBR\n13) TEST tunnels (connect + speed + recommendation)"
               "\n14) Update tunnel settings (IPs / SNI / rotate keys)"
               "\n15) EASY SETUP: build the tunnel + auto-install the other server over SSH"
-              "\n16) Web panel first (then set up everything from the browser)"
+              "\n16) WEB PANEL: create it / show its URL + new password (set up everything from the browser)"
               "\n17) Telegram proxy (separate from the tunnels)"
               "\n18) Security mode (with / without password)\n0) Exit")
         c = input("Choose: ").strip()
@@ -3109,7 +3149,7 @@ def menu():
             elif c == "0":
                 return
         except FileNotFoundError:
-            say("Not configured yet: run setup first.", R)
+            say("Not configured yet: create the web panel (16) or run the easy setup (15).", R)
 
 
 def engine_cmd():
