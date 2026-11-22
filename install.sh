@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # night-tunnel one-line installer (Debian/Ubuntu)
 set -e
-REPO_RAW="${NT_REPO_RAW:-https://raw.githubusercontent.com/YOUR_USER/night-tunnel/main}"
+REPO_RAW="${NT_REPO_RAW:-https://raw.githubusercontent.com/Night-net83/night-tunnel/main}"
 [ "$(id -u)" -ne 0 ] && { echo "Run as root."; exit 1; }
 command -v apt-get >/dev/null || { echo "Debian/Ubuntu only."; exit 1; }
 export DEBIAN_FRONTEND=noninteractive
