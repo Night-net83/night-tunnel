@@ -1,0 +1,3136 @@
+#!/usr/bin/env python3
+"""night-tunnel: multi-transport, anti-DPI tunnel manager.
+
+Engine : gost v3 (relay over tls/mtls/wss/mwss/grpc/quic/kcp/...)
+Carriers: WireGuard / GRE / VXLAN (L3 links the gost relay can also ride on)
+Panel  : HTTPS web panel with random path/user/password
+Roles  : foreign (exit server) and iran (entry server)
+"""
+import ast
+import base64
+import getpass
+import concurrent.futures
+import hashlib
+import hmac
+import html
+import ipaddress
+import json
+import os
+import random
+import re
+import secrets
+import shlex
+import shutil
+import socket
+import ssl
+import string
+import subprocess
+import sys
+import tarfile
+import tempfile
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs
+
+NAME = "night-tunnel"
+VERSION = "1.3.0"
+BASE = os.environ.get("NT_BASE", "/etc/night-tunnel")
+STATE = BASE + "/state.json"
+GOST_CFG = BASE + "/gost.json"
+CERT = BASE + "/cert.pem"
+KEY = BASE + "/key.pem"
+OPT = "/opt/night-tunnel"
+FW = BASE + "/fw.json"
+ERR = "!"
+
+# id -> (gost type, udp based, description, default enabled)
+CATALOG = {
+    "mtls": ("mtls", False, "TLS + multiplex", True),
+    "tls": ("tls", False, "TLS", True),
+    "wss": ("wss", False, "WebSocket over TLS", True),
+    "mwss": ("mwss", False, "WebSocket+TLS + multiplex", True),
+    "grpc": ("grpc", False, "gRPC (HTTP/2)", True),
+    "quic": ("quic", True, "QUIC (UDP)", True),
+    "kcp": ("kcp", True, "KCP (UDP, low latency / gaming)", True),
+    "h2": ("h2", False, "HTTP/2", False),
+    "ws": ("ws", False, "WebSocket (plain)", False),
+    "mws": ("mws", False, "WebSocket + multiplex", False),
+    "otls": ("otls", False, "obfs-tls", False),
+    "ohttp": ("ohttp", False, "obfs-http", False),
+    "mtcp": ("mtcp", False, "TCP + multiplex", False),
+    "tcp": ("tcp", False, "Plain TCP", False),
+    "udp": ("udp", True, "Plain UDP relay", False),
+}
+TLS_DIALERS = {"tls", "mtls", "wss", "mwss", "grpc", "h2"}
+WS_TYPES = {"ws", "wss", "mws", "mwss"}
+CARRIERS = {
+    "wg": ("WireGuard", "10.66.0"),
+    "gre": ("GRE", "10.67.0"),
+    "vxlan": ("VXLAN", "10.68.0"),
+    "ipip": ("IPIP", "10.69.0"),
+    "geneve": ("GENEVE", "10.70.0"),
+    "fou": ("IPIP over UDP (FOU)", "10.71.0"),
+}
+DEV = {"wg": "nt-wg", "gre": "nt-gre", "vxlan": "nt-vx", "ipip": "nt-ipip",
+       "geneve": "nt-gnv", "fou": "nt-fou"}
+# carriers that use a UDP port / that are raw IP protocols (need a protocol firewall rule)
+UDP_CARRIERS = {"wg", "vxlan", "geneve", "fou"}
+IPPROTO = {"gre": "gre", "ipip": "4"}
+# layer map used when the user picks a tunnel to build
+LAYERS = [
+    ("L7  web camouflage", ["wss", "mwss", "ws", "mws", "grpc", "h2", "ohttp"]),
+    ("L5  TLS", ["mtls", "tls", "otls"]),
+    ("L4  TCP/UDP", ["mtcp", "tcp", "quic", "kcp", "udp"]),
+    ("L3  kernel tunnels", ["wg", "gre", "ipip", "vxlan", "geneve", "fou"]),
+]
+KCHAIN = "NT-K"
+KPOST = "NT-KP"
+KLOCK = "NT-LOCK"
+# transports whose payload is encrypted end-to-end (TLS / QUIC); WireGuard is the only encrypted carrier
+ENCRYPTED = {"tls", "mtls", "wss", "mwss", "grpc", "h2", "quic"}
+BOOT = BASE + "/boot.json"           # panel-only config (panel started before any tunnel exists)
+TGBASE = BASE + "-tg"                # Telegram proxy lives apart from the tunnel config (survives a tunnel reset)
+TG_STATE = TGBASE + "/tg.json"
+TG_CFG = TGBASE + "/mtg.toml"
+
+G, Y, R, N = "\033[32m", "\033[33m", "\033[31m", "\033[0m"
+
+
+# ----------------------------------------------------------------- helpers
+def sh(cmd, inp=None):
+    return subprocess.run(cmd, shell=True, input=inp, capture_output=True, text=True)
+
+
+def say(msg, color=N):
+    print(f"{color}{msg}{N}")
+
+
+def need_root():
+    if os.geteuid() != 0 and not os.environ.get("NT_BASE"):
+        say("Run as root.", R)
+        sys.exit(1)
+
+
+def load():
+    with open(STATE) as f:
+        return json.load(f)
+
+
+def save(st):
+    os.makedirs(BASE, exist_ok=True)
+    tmp = STATE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(st, f, indent=1)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, STATE)
+
+
+def rnd(n=16):
+    a = string.ascii_letters + string.digits
+    return "".join(secrets.choice(a) for _ in range(n))
+
+
+def can_bind(p):
+    for kind in (socket.SOCK_STREAM, socket.SOCK_DGRAM):
+        s = socket.socket(socket.AF_INET, kind)
+        try:
+            s.bind(("0.0.0.0", p))
+        except OSError:
+            return False
+        finally:
+            s.close()
+    return True
+
+
+def free_port(used):
+    while True:
+        p = random.randint(20000, 60000)
+        if p not in used and can_bind(p):
+            used.add(p)
+            return p
+
+
+def ask(prompt, default=""):
+    v = input(f"{prompt}" + (f" [{default}]" if default else "") + ": ").strip()
+    return v or default
+
+
+def valid_host(h):
+    return bool(re.fullmatch(r"[A-Za-z0-9.-]{1,253}", h))
+
+
+def valid_ip(h):
+    try:
+        ipaddress.IPv4Address(h)
+        return True
+    except ValueError:
+        return False
+
+
+def public_ip():
+    for u in ("https://api.ipify.org", "https://ifconfig.me", "https://icanhazip.com"):
+        r = sh(f"curl -s4 --max-time 6 {u}")
+        ip = r.stdout.strip()
+        if valid_ip(ip):
+            return ip
+    return ""
+
+
+def local_ip(remote):
+    m = re.search(r"src (\S+)", sh(f"ip -4 route get {remote}").stdout)
+    return m.group(1) if m else ""
+
+
+def wg_keypair():
+    priv = sh("wg genkey").stdout.strip()
+    pub = sh("wg pubkey", inp=priv + "\n").stdout.strip()
+    return priv, pub
+
+
+def fw_list():
+    try:
+        with open(FW) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return []
+
+
+def _fw_apply(key, add):
+    pk = next((k for k in IPPROTO if key.startswith(k + ":")), None)
+    if pk:
+        cmd = f"-p {IPPROTO[pk]} -s {key[len(pk) + 1:]} -j ACCEPT"
+        if add and sh(f"iptables -C INPUT {cmd}").returncode != 0:
+            sh(f"iptables -I INPUT {cmd}")
+        elif not add:
+            sh(f"iptables -D INPUT {cmd}")
+    elif sh("ufw status").stdout.startswith("Status: active"):
+        sh(f"ufw {'allow' if add else 'delete allow'} {key}")
+
+
+def fw_add(key):
+    _fw_apply(key, True)
+    lst = fw_list()
+    if key not in lst:
+        lst.append(key)
+    os.makedirs(BASE, exist_ok=True)
+    with open(FW, "w") as f:
+        json.dump(lst, f)
+
+
+def fw_del(key):
+    _fw_apply(key, False)
+    lst = [k for k in fw_list() if k != key]
+    if os.path.isdir(BASE):
+        with open(FW, "w") as f:
+            json.dump(lst, f)
+
+
+def fw_open(port, proto="tcp"):
+    fw_add(f"{int(port)}/{proto}")
+
+
+def fw_close(port, proto="tcp"):
+    fw_del(f"{int(port)}/{proto}")
+
+
+def fw_gre(src):
+    fw_add("gre:" + src)
+
+
+def fw_carrier(st, name, add=True):
+    """Open/close the firewall for one L3 carrier (UDP port or raw IP protocol)."""
+    c = (st.get("l3") or {}).get(name, {})
+    peer = st["iran_ip"] if st["role"] == "foreign" else st["foreign_ip"]
+    if name in UDP_CARRIERS and c.get("port"):
+        (fw_open if add else fw_close)(c["port"], "udp")
+    if name in IPPROTO:
+        (fw_add if add else fw_del)(f"{name}:{peer}")
+
+
+def fw_clear():
+    for k in fw_list():
+        _fw_apply(k, False)
+    if os.path.exists(FW):
+        os.remove(FW)
+
+
+# ------------------------------------------------------------ certificates
+HOOK = "/etc/letsencrypt/renewal-hooks/deploy/night-tunnel.sh"
+
+
+def make_cert(domain, sni):
+    os.makedirs(BASE, exist_ok=True)
+    if domain:
+        if not shutil.which("certbot"):
+            sh("apt-get install -y certbot")
+        r = sh(f"certbot certonly --standalone -d {domain} --non-interactive "
+               f"--agree-tos --register-unsafely-without-email")
+        live = f"/etc/letsencrypt/live/{domain}"
+        if os.path.exists(live + "/fullchain.pem"):
+            shutil.copy(live + "/fullchain.pem", CERT)
+            shutil.copy(live + "/privkey.pem", KEY)
+            os.chmod(KEY, 0o600)
+            os.makedirs(os.path.dirname(HOOK), exist_ok=True)
+            with open(HOOK, "w") as f:
+                f.write(f"#!/bin/sh\ncp {live}/fullchain.pem {CERT}\n"
+                        f"cp {live}/privkey.pem {KEY}\nchmod 600 {KEY}\n"
+                        f"systemctl restart night-tunnel-gost night-tunnel-panel\n")
+            os.chmod(HOOK, 0o755)
+            say(f"Let's Encrypt certificate issued for {domain} (auto-renew on).", G)
+            return True
+        say("Let's Encrypt failed (is port 80 free and the domain pointing here?):", R)
+        print((r.stderr or r.stdout)[-400:])
+        say("Falling back to a self-signed certificate.", Y)
+    sh(f'openssl req -x509 -newkey rsa:2048 -nodes -days 3650 -keyout {KEY} '
+       f'-out {CERT} -subj "/CN={sni or "localhost"}"')
+    os.chmod(KEY, 0o600)
+    return False
+
+
+# --------------------------------------------------------------- L3 carriers
+def l3_down():
+    try:
+        fp = (load().get("l3") or {}).get("fou", {}).get("port")
+    except (OSError, ValueError):
+        fp = None
+    for dev in DEV.values():
+        sh(f"ip link del {dev}")
+    if fp:
+        sh(f"ip fou del port {int(fp)}")
+    kernel_fw_clear()
+
+
+def l3_up():
+    st = load()
+    l3 = st.get("l3") or {}
+    l3_down()
+    lock_fw(st)
+    if not l3:
+        return
+    foreign = st["role"] == "foreign"
+    remote = st["iran_ip"] if foreign else st["foreign_ip"]
+    local = local_ip(remote)
+    for name, c in l3.items():
+        mine = c["f_ip"] if foreign else c["i_ip"]
+        dev = DEV[name]
+        cmds = []
+        if name == "wg":
+            keyf = BASE + "/wg.key"
+            with open(keyf, "w") as f:
+                f.write((c["f_priv"] if foreign else c["i_priv"]) + "\n")
+            os.chmod(keyf, 0o600)
+            cmds.append(f"ip link add {dev} type wireguard")
+            if foreign:
+                cmds.append(f"wg set {dev} private-key {keyf} listen-port {c['port']} "
+                            f"peer {c['i_pub']} allowed-ips {c['i_ip']}/32")
+            else:
+                cmds.append(f"wg set {dev} private-key {keyf} peer {c['f_pub']} "
+                            f"allowed-ips {c['f_ip']}/32 endpoint {remote}:{c['port']} "
+                            f"persistent-keepalive 15")
+            mtu = 1380
+        elif name == "gre":
+            cmds.append(f"ip tunnel add {dev} mode gre local {local} remote {remote} ttl 255")
+            mtu = 1400
+        elif name == "ipip":
+            cmds.append(f"ip tunnel add {dev} mode ipip local {local} remote {remote} ttl 255")
+            mtu = 1400
+        elif name == "geneve":
+            cmds.append(f"ip link add {dev} type geneve id {c['vni']} remote {remote} dstport {c['port']}")
+            mtu = 1380
+        elif name == "fou":
+            sh("modprobe fou; modprobe ipip")
+            cmds.append(f"ip fou add port {c['port']} ipproto 4")
+            cmds.append(f"ip link add {dev} type ipip local {local} remote {remote} "
+                        f"encap fou encap-sport auto encap-dport {c['port']}")
+            mtu = 1380
+        else:
+            cmds.append(f"ip link add {dev} type vxlan id {c['vni']} local {local} "
+                        f"remote {remote} dstport {c['port']}")
+            mtu = 1380
+        cmds += [f"ip addr add {mine}/30 dev {dev}", f"ip link set {dev} mtu {mtu} up"]
+        for cmd in cmds:
+            r = sh(cmd)
+            if r.returncode != 0:
+                print(f"[{name}] {cmd}\n  -> {r.stderr.strip()}")
+                break
+        if not foreign:  # entry side must also accept the peer's packets
+            fw_carrier(st, name, True)
+    kernel_fw(st)
+
+
+def make_l3(carriers, st, used=None):
+    used = used if used is not None else {st["panel"]["port"]}
+    l3 = {}
+    for c in carriers:
+        base = CARRIERS[c][1]
+        e = {"f_ip": base + ".1", "i_ip": base + ".2"}
+        if c == "wg":
+            e["port"] = free_port(used)
+            e["f_priv"], e["f_pub"] = wg_keypair()
+            e["i_priv"], e["i_pub"] = wg_keypair()
+        elif c in ("vxlan", "geneve"):
+            e["port"] = free_port(used)
+            e["vni"] = random.randint(100, 9999)
+        elif c == "fou":
+            e["port"] = free_port(used)
+        l3[c] = e
+    return l3
+
+
+# ------------------------------------------------- kernel-level port forwarding
+def _ipt(args):
+    return sh(f"iptables -w {args}")
+
+
+def kernel_fw_clear():
+    lock_clear()
+    hooks = (("nat", "PREROUTING", KCHAIN), ("nat", "POSTROUTING", KPOST),
+             ("filter", "INPUT", KCHAIN), ("filter", "FORWARD", KCHAIN))
+    for tbl, hook, ch in hooks:
+        for _ in range(5):
+            if _ipt(f"-t {tbl} -D {hook} -j {ch}").returncode != 0:
+                break
+    for tbl, ch in (("nat", KCHAIN), ("nat", KPOST), ("filter", KCHAIN)):
+        _ipt(f"-t {tbl} -F {ch}")
+        _ipt(f"-t {tbl} -X {ch}")
+
+
+def kernel_ports(st):
+    """Forwarded ports that bypass gost and ride a kernel tunnel (iptables DNAT)."""
+    l3 = st.get("l3") or {}
+    return [p for p in st.get("ports", []) if p.get("via") in l3]
+
+
+def kernel_fw(st):
+    """(Re)build the iptables rules for kernel-mode forwarding.
+    Iran   : DNAT port P -> <foreign inner ip>:target over the carrier + MASQUERADE.
+    Foreign: everything arriving on a carrier (except the gost relay ports) is redirected to 127.0.0.1,
+             so a kernel-forwarded port P reaches 127.0.0.1:P just like the relay pool does."""
+    kernel_fw_clear()
+    l3 = st.get("l3") or {}
+    if not l3:
+        return
+    foreign = st["role"] == "foreign"
+    nat, post, flt = [], [], []
+    if foreign:
+        for name, c in l3.items():
+            dev, ip = DEV[name], c["f_ip"]
+            sh(f"sysctl -qw net.ipv4.conf.{dev}.route_localnet=1 net.ipv4.conf.{dev}.rp_filter=0")
+            for t in st["transports"]:
+                if t["via"] == name:
+                    nat.append(f"-i {dev} -d {ip} -p tcp --dport {t['port']} -j RETURN")
+            for proto in ("tcp", "udp"):
+                nat.append(f"-i {dev} -d {ip} -p {proto} -j DNAT --to-destination 127.0.0.1")
+            flt.append(f"-i {dev} -j ACCEPT")
+        hook = "INPUT"
+    else:
+        kp = kernel_ports(st)
+        if not kp:
+            return
+        sh("sysctl -qw net.ipv4.ip_forward=1")
+        devs = set()
+        for p in kp:
+            tgt = f"{l3[p['via']]['f_ip']}:{p.get('target') or p['port']}"
+            for proto in (["tcp", "udp"] if p["proto"] == "both" else [p["proto"]]):
+                nat.append(f"-p {proto} --dport {p['port']} -j DNAT --to-destination {tgt}")
+            devs.add(DEV[p["via"]])
+        for dev in sorted(devs):
+            post.append(f"-o {dev} -j MASQUERADE")
+            flt += [f"-i {dev} -j ACCEPT", f"-o {dev} -j ACCEPT"]
+        hook = "FORWARD"
+    for tbl, ch, hk, rules in (("nat", KCHAIN, "PREROUTING", nat), ("nat", KPOST, "POSTROUTING", post),
+                               ("filter", KCHAIN, hook, flt)):
+        if not rules:
+            continue
+        _ipt(f"-t {tbl} -N {ch}")
+        for r in rules:
+            _ipt(f"-t {tbl} -A {ch} {r}")
+        _ipt(f"-t {tbl} -I {hk} -j {ch}")
+
+
+# ------------------------------------------------------------ security mode
+def is_secure(st):
+    """True = relay login (user/password) is required. False = 'no password' mode: the foreign server
+    only accepts relay connections from the Iran server's IP (firewall) instead."""
+    return st.get("secure", True)
+
+
+def auth_of(st):
+    return {"username": st["auth"]["u"], "password": st["auth"]["p"]}
+
+
+def enc_of(t):
+    """'yes' if the tunnel payload is encrypted end-to-end, else 'no'."""
+    if t["via"] == "direct":
+        return "yes" if ttype(t) in ENCRYPTED else "no"
+    return "yes" if t["via"] == "wg" else "no"
+
+
+def lock_clear():
+    for _ in range(5):
+        if _ipt(f"-D INPUT -j {KLOCK}").returncode != 0:
+            break
+    _ipt(f"-F {KLOCK}")
+    _ipt(f"-X {KLOCK}")
+
+
+def lock_fw(st):
+    """No-password mode on the foreign server: relay ports answer only to the Iran server's IP."""
+    lock_clear()
+    if st["role"] != "foreign" or is_secure(st):
+        return
+    rules = []
+    for t in st["transports"]:
+        if t["enabled"] and t["via"] == "direct":
+            proto = "udp" if CATALOG[ttype(t)][1] else "tcp"
+            rules += [f"-p {proto} --dport {t['port']} -s {st['iran_ip']} -j ACCEPT",
+                      f"-p {proto} --dport {t['port']} -j DROP"]
+    if not rules:
+        return
+    _ipt(f"-N {KLOCK}")
+    for r in rules:
+        _ipt(f"-A {KLOCK} {r}")
+    _ipt(f"-I INPUT -j {KLOCK}")
+
+
+def op_security(st, secure):
+    if st["role"] != "foreign":
+        return ERR + "Change the security mode on the foreign server, then Sync token on the Iran server."
+    if bool(secure) == is_secure(st):
+        return "Security mode unchanged."
+    st["secure"] = bool(secure)
+    if secure:
+        st["auth"] = {"u": "u" + rnd(6), "p": rnd(20)}  # fresh credentials when the password comes back
+    detached_panel_restart()  # the tester's port is derived from the credentials
+    if secure:
+        return ("Password mode ON: relay login required, new credentials generated. "
+                "Copy the new token to the Iran server (Sync token).")
+    return ("NO-PASSWORD mode ON: no login, but relay ports accept only the Iran server's IP "
+            f"({st['iran_ip']}) and plain transports are NOT encrypted. Copy the new token to the Iran server.")
+
+
+# ------------------------------------------------------------ gost config
+def ttype(t):
+    """Catalog type of a transport entry (an entry may be a named instance of a type)."""
+    return t.get("type") or t["id"]
+
+
+def tp_meta(t):
+    md = {}
+    if ttype(t) in WS_TYPES:
+        if t.get("path"):
+            md["path"] = t["path"]
+        if t.get("host"):
+            md["host"] = t["host"]
+    return md
+
+
+def dial_node(st, t):
+    """gost chain node (Iran side) for one transport entry; also used by the tunnel tester."""
+    if t["via"] == "direct":
+        addr, dtype = f"{st['foreign_ip']}:{t['port']}", CATALOG[ttype(t)][0]
+    else:
+        addr, dtype = f"{st['l3'][t['via']]['f_ip']}:{t['port']}", "tcp"
+    dialer = {"type": dtype}
+    if dtype in TLS_DIALERS:
+        dialer["tls"] = {"serverName": t.get("sni") or st.get("sni") or "localhost"}
+    md = tp_meta(t) if t["via"] == "direct" else {}
+    if md:
+        dialer["metadata"] = md
+    conn = {"type": "relay"}
+    if is_secure(st):
+        conn["auth"] = auth_of(st)
+    return {"name": "n-" + t["id"], "addr": addr, "connector": conn, "dialer": dialer}
+
+
+def gen_gost(st):
+    on = [t for t in st["transports"] if t["enabled"]]
+    if st["role"] == "foreign":
+        svcs = []
+        for t in on:
+            if t["via"] == "direct":
+                addr, ltype = f":{t['port']}", CATALOG[ttype(t)][0]
+            else:
+                addr, ltype = f"{st['l3'][t['via']]['f_ip']}:{t['port']}", "tcp"
+            lis = {"type": ltype}
+            md = {k: v for k, v in tp_meta(t).items() if k == "path"}
+            if md and t["via"] == "direct":
+                lis["metadata"] = md
+            handler = {"type": "relay"}
+            if is_secure(st):
+                handler["auth"] = auth_of(st)
+            svcs.append({"name": "in-" + t["id"], "addr": addr, "handler": handler, "listener": lis})
+        return {"log": {"level": "warn"}, "tls": {"certFile": CERT, "keyFile": KEY},
+                "services": svcs}
+    nodes = [dial_node(st, t) for t in on]
+    chain = {"name": "pool", "hops": [{
+        "name": "hop",
+        "selector": {"strategy": st.get("strategy", "fifo"), "maxFails": 1, "failTimeout": "30s"},
+        "nodes": nodes}]}
+    svcs = []
+    for p in st.get("ports", []):
+        if p.get("via") in (st.get("l3") or {}):
+            continue  # kernel-forwarded port: handled by iptables, not gost
+        protos = ["tcp", "udp"] if p["proto"] == "both" else [p["proto"]]
+        for proto in protos:
+            svcs.append({"name": f"fwd-{proto}-{p['port']}", "addr": f":{p['port']}",
+                         "handler": {"type": proto, "chain": "pool"},
+                         "listener": {"type": proto},
+                         "forwarder": {"nodes": [{"name": "t",
+                                                  "addr": f"127.0.0.1:{p.get('target') or p['port']}"}]}})
+    return {"log": {"level": "warn"}, "services": svcs, "chains": [chain]}
+
+
+def apply(st=None):
+    st = st or load()
+    kernel_fw(st)
+    lock_fw(st)
+    cfg = gen_gost(st)
+    if not cfg["services"] or (st["role"] == "iran" and not cfg["chains"][0]["hops"][0]["nodes"]):
+        sh("systemctl stop night-tunnel-gost")
+        return bool(kernel_ports(st))  # kernel-only forwarding needs no gost
+    with open(GOST_CFG, "w") as f:
+        json.dump(cfg, f, indent=1)
+    os.chmod(GOST_CFG, 0o600)
+    sh("systemctl restart night-tunnel-gost")
+    return True
+
+
+# ---------------------------------------------------------------- presets
+def preset(st, name):
+    ids = [t["id"] for t in st["transports"]]
+    carriers = [i for i in ids if i in CARRIERS]
+    plan = {
+        "stealth": (["wss", "mwss", "tls", "mtls", "grpc"], "rand", False),
+        "balanced": (["mtls", "tls", "wss", "grpc", "quic", "kcp"], "fifo", True),
+        "game": (["quic", "kcp", "udp"], "fifo", True),
+        "rotate": (["mtls", "tls", "wss", "mwss", "grpc", "quic", "kcp"], "rand", True),
+    }[name]
+    first = [i for i in plan[0] if i in ids]
+    back = carriers if plan[2] else []
+    order = first + back
+    rest = [i for i in ids if i not in order]
+    byid = {t["id"]: t for t in st["transports"]}
+    st["transports"] = [byid[i] for i in order + rest]
+    for t in st["transports"]:
+        t["enabled"] = t["id"] in order
+    st["strategy"] = plan[1]
+
+
+# ------------------------------------------------------------------ tokens
+def make_token(st):
+    d = {"v": 1, "foreign_ip": st["foreign_ip"], "iran_ip": st["iran_ip"],
+         "auth": st["auth"], "sni": st.get("sni", ""), "secure": is_secure(st),
+         "transports": [t for t in st["transports"] if t["enabled"]], "l3": {}}
+    for k, c in st.get("l3", {}).items():
+        e = {x: c[x] for x in ("f_ip", "i_ip", "port", "vni", "f_pub", "i_priv") if x in c}
+        d["l3"][k] = e
+    raw = json.dumps(d, separators=(",", ":")).encode()
+    return "NT1:" + base64.urlsafe_b64encode(raw).decode()
+
+
+def parse_token(tok):
+    tok = tok.strip()
+    if not tok.startswith("NT1:"):
+        raise ValueError("bad token")
+    return json.loads(base64.urlsafe_b64decode(tok[4:].encode()))
+
+
+# ------------------------------------------------------------- panel auth
+def hash_pw(pw, salt):
+    return hashlib.scrypt(pw.encode(), salt=bytes.fromhex(salt), n=2 ** 14, r=8, p=1).hex()
+
+
+def new_panel(domain, host):
+    used = set()
+    pw = rnd(16)
+    salt = secrets.token_hex(16)
+    p = {"port": free_port(used), "path": rnd(14), "user": "nt" + rnd(5).lower(),
+         "salt": salt, "pass_hash": hash_pw(pw, salt), "host": domain or host}
+    return p, pw
+
+
+def panel_url(st):
+    p = st["panel"]
+    return f"https://{p['host']}:{p['port']}/{p['path']}/"
+
+
+# ------------------------------------------------------------------ probes
+def probe(st, t):
+    udp = CATALOG.get(ttype(t), ("", False))[1] if t["via"] == "direct" else False
+    if udp:
+        return "udp"
+    if st["role"] == "foreign":
+        host = "127.0.0.1" if t["via"] == "direct" else st["l3"][t["via"]]["f_ip"]
+    else:
+        host = st["foreign_ip"] if t["via"] == "direct" else st["l3"][t["via"]]["f_ip"]
+    try:
+        with socket.create_connection((host, t["port"]), timeout=2):
+            return "up"
+    except OSError:
+        return "down"
+
+
+def probe_all(st):
+    with concurrent.futures.ThreadPoolExecutor(max_workers=16) as ex:
+        res = list(ex.map(lambda t: probe(st, t), st["transports"]))
+    return {t["id"]: r for t, r in zip(st["transports"], res)}
+
+
+def desc(t):
+    extra = "".join(f" [{k}={t[k]}]" for k in ("sni", "path", "host") if t.get(k))
+    lock = " [enc]" if enc_of(t) == "yes" else " [plain]"
+    if t["via"] == "direct":
+        return CATALOG[ttype(t)][2] + extra + lock
+    return f"Relay over {CARRIERS[t['via']][0]} link" + lock
+
+
+# --------------------------------------------------------------- operations
+# Shared by the CLI menu and the web panel. Return a message; ERR prefix = error.
+def ports_taken(st):
+    taken = {st["panel"]["port"]} | {t["port"] for t in st["transports"]}
+    taken |= {c["port"] for c in st.get("l3", {}).values() if c.get("port")}
+    return taken
+
+
+def find_tp(st, tid):
+    return next((t for t in st["transports"] if t["id"] == tid), None)
+
+
+def only_foreign(st):
+    if st["role"] != "foreign":
+        return ERR + "Do this on the foreign server, then use Sync token here."
+    return None
+
+
+def op_set_ids(st, ids):
+    byid = {t["id"]: t for t in st["transports"]}
+    ids = [i for i in ids if i in byid]
+    if not ids:
+        return ERR + "No valid transport ids."
+    rest = [i for i in byid if i not in ids]
+    st["transports"] = [byid[i] for i in ids + rest]
+    for t in st["transports"]:
+        t["enabled"] = t["id"] in ids
+    return "Active (in priority order): " + ", ".join(ids)
+
+
+def op_tp_port(st, tid, port):
+    e = only_foreign(st)
+    if e:
+        return e
+    t = find_tp(st, tid)
+    if not t:
+        return ERR + "Unknown transport."
+    try:
+        port = int(port)
+        assert 1 <= port <= 65535 and port != 22
+    except (ValueError, AssertionError):
+        return ERR + "Invalid port."
+    if port == t["port"]:
+        return "Port unchanged."
+    if port in ports_taken(st):
+        return ERR + "Port already used by the tunnel."
+    if t["via"] == "direct" and not can_bind(port):
+        return ERR + "Port is in use by another program."
+    old, t["port"] = t["port"], port
+    if t["via"] == "direct":
+        proto = "udp" if CATALOG[ttype(t)][1] else "tcp"
+        fw_close(old, proto)
+        fw_open(port, proto)
+    return f"{tid}: port {old} -> {port}. Copy the new token to the Iran server (Sync token)."
+
+
+def _l3_fw_remove(st, name):
+    fw_carrier(st, name, False)
+
+
+def op_tp_edit(st, tid, port="", sni=None, path=None, host=None, new_type=""):
+    """Edit one transport: port, TLS SNI, WebSocket path/host, or switch its transport type
+    (e.g. mtls -> wss) while keeping its name. Empty string clears sni/path/host."""
+    e = only_foreign(st) if (port or new_type or path is not None or host is not None) else None
+    if e:
+        return e
+    t = find_tp(st, tid)
+    if not t:
+        return ERR + "Unknown transport."
+    out = []
+    if new_type and new_type != ttype(t):
+        if t["via"] != "direct":
+            return ERR + "Kernel-carrier relays have no type to switch (delete / add the carrier instead)."
+        if new_type not in CATALOG or new_type in CARRIERS:
+            return ERR + "Unknown transport type."
+        oldp = "udp" if CATALOG[ttype(t)][1] else "tcp"
+        newp = "udp" if CATALOG[new_type][1] else "tcp"
+        if oldp != newp:
+            fw_close(t["port"], oldp)
+            fw_open(t["port"], newp)
+        t["type"] = new_type
+        if new_type not in WS_TYPES:
+            t.pop("path", None)
+            t.pop("host", None)
+        out.append(f"type -> {new_type}")
+    if port and str(port) != str(t["port"]):
+        m = op_tp_port(st, tid, port)
+        if m.startswith(ERR):
+            return m
+        out.append(f"port -> {t['port']}")
+    for key, val in (("sni", sni), ("path", path), ("host", host)):
+        if val is None:
+            continue
+        val = val.strip()
+        if key == "path" and val and not val.startswith("/"):
+            val = "/" + val
+        if val and not re.fullmatch(r"[A-Za-z0-9._/~-]{1,120}", val):
+            return ERR + f"Invalid {key}."
+        if key in ("path", "host") and ttype(t) not in WS_TYPES:
+            continue
+        if val:
+            t[key] = val
+        else:
+            t.pop(key, None)
+        out.append(f"{key} -> {val or 'default'}")
+    if not out:
+        return "Nothing changed."
+    return f"{tid}: " + ", ".join(out) + ". Copy the new token to the Iran server (Sync token)."
+
+
+def op_tp_del(st, tid):
+    e = only_foreign(st)
+    if e:
+        return e
+    t = find_tp(st, tid)
+    if not t:
+        return ERR + "Unknown transport."
+    if len(st["transports"]) <= 1:
+        return ERR + "At least one transport must remain."
+    st["transports"].remove(t)
+    if t["via"] == "direct":
+        fw_close(t["port"], "udp" if CATALOG[ttype(t)][1] else "tcp")
+    else:
+        _l3_fw_remove(st, t["via"])
+        st["l3"].pop(t["via"], None)
+        save(st)
+        sh("systemctl restart night-tunnel-l3")
+    if not any(x["enabled"] for x in st["transports"]):
+        st["transports"][0]["enabled"] = True
+    return f"Transport {tid} deleted. Copy the new token to the Iran server (Sync token)."
+
+
+def op_tp_add(st, tid, name="", port="", sni="", path="", host=""):
+    """Add a transport of catalog type `tid`. `name` lets you build several instances of the
+    same type (e.g. wss + wss-cdn on different ports / SNI)."""
+    e = only_foreign(st)
+    if e:
+        return e
+    if tid in CARRIERS:
+        return op_carrier_add(st, tid)
+    name = (name or tid).strip()
+    if tid not in CATALOG or not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,23}", name):
+        return ERR + "Transport type unknown or invalid name."
+    if find_tp(st, name) or name in CARRIERS:
+        return ERR + "A tunnel with this name already exists (pick another name)."
+    if port:
+        try:
+            port = int(port)
+            assert 1 <= port <= 65535 and port != 22
+        except (ValueError, AssertionError):
+            return ERR + "Invalid port."
+        if port in ports_taken(st) or not can_bind(port):
+            return ERR + "Port already in use."
+    else:
+        port = free_port(ports_taken(st))
+    t = {"id": name, "port": port, "enabled": True, "via": "direct"}
+    if name != tid:
+        t["type"] = tid
+    st["transports"].append(t)
+    fw_open(port, "udp" if CATALOG[tid][1] else "tcp")
+    if sni or path or host:
+        m = op_tp_edit(st, name, sni=sni or None, path=path or None, host=host or None)
+        if m.startswith(ERR):
+            return m
+    return f"Tunnel {name} ({tid}) added on port {port}. Copy the new token to the Iran server."
+
+
+def op_carrier_add(st, c):
+    e = only_foreign(st)
+    if e:
+        return e
+    if c not in CARRIERS or c in st.get("l3", {}) or find_tp(st, c):
+        return ERR + "Carrier unknown or already present."
+    used = ports_taken(st)
+    st.setdefault("l3", {})[c] = make_l3([c], st, used)[c]
+    st["transports"].append({"id": c, "port": free_port(used), "enabled": True, "via": c})
+    fw_carrier(st, c, True)
+    save(st)
+    sh("systemctl restart night-tunnel-l3")
+    return f"Carrier {CARRIERS[c][0]} added. Copy the new token to the Iran server."
+
+
+def port_check(st, port, exclude=None):
+    try:
+        port = int(port)
+        assert 1 <= port <= 65535 and port not in (22, st["panel"]["port"])
+    except (ValueError, AssertionError):
+        return None, ERR + "Invalid port."
+    if port != exclude and any(p["port"] == port for p in st["ports"]):
+        return None, ERR + "Port already forwarded."
+    return port, None
+
+
+def _target(v):
+    v = str(v or "").strip()
+    return int(v) if v.isdigit() and 1 <= int(v) <= 65535 else None
+
+
+def _fw_ports(p, add):
+    for pr in (["tcp", "udp"] if p["proto"] == "both" else [p["proto"]]):
+        (fw_open if add else fw_close)(p["port"], pr)
+
+
+def _via(st, via):
+    """'' / 'pool' = gost transport pool; a carrier name = kernel forwarding over that carrier."""
+    via = (via or "").strip()
+    if via in ("", "pool"):
+        return "", None
+    if via not in (st.get("l3") or {}):
+        return None, ERR + "Kernel path unknown (carriers available: " + (", ".join(st.get("l3") or {}) or "none") + ")."
+    return via, None
+
+
+def op_port_add(st, port, proto="tcp", target="", via=""):
+    if st["role"] != "iran":
+        return ERR + "Ports are forwarded on the Iran server."
+    port, err = port_check(st, port)
+    if err:
+        return err
+    if proto not in ("tcp", "udp", "both"):
+        return ERR + "Invalid protocol."
+    via, err = _via(st, via)
+    if err:
+        return err
+    p = {"port": port, "proto": proto}
+    if _target(target):
+        p["target"] = _target(target)
+    if via:
+        p["via"] = via
+    st["ports"].append(p)
+    _fw_ports(p, True)
+    return f"Port {port}/{proto} added" + (f" (kernel path: {via})." if via else " (relay pool).")
+
+
+def op_port_edit(st, old, port, proto, target, via=None):
+    if st["role"] != "iran":
+        return ERR + "Ports are forwarded on the Iran server."
+    p = next((x for x in st["ports"] if str(x["port"]) == str(old)), None)
+    if not p:
+        return ERR + "Unknown port."
+    new, err = port_check(st, port, exclude=p["port"])
+    if err:
+        return err
+    if proto not in ("tcp", "udp", "both"):
+        return ERR + "Invalid protocol."
+    nvia = p.get("via", "")
+    if via is not None:
+        nvia, err = _via(st, via)
+        if err:
+            return err
+    _fw_ports(p, False)
+    p["port"], p["proto"] = new, proto
+    p.pop("target", None)
+    p.pop("via", None)
+    if _target(target):
+        p["target"] = _target(target)
+    if nvia:
+        p["via"] = nvia
+    _fw_ports(p, True)
+    return (f"Port updated: {new}/{proto}" + (f" -> remote {p['target']}" if p.get("target") else "")
+            + (f" (kernel path: {nvia})" if nvia else " (relay pool)"))
+
+
+def op_port_del(st, port):
+    if st["role"] != "iran":
+        return ERR + "Ports are forwarded on the Iran server."
+    p = next((x for x in st["ports"] if str(x["port"]) == str(port)), None)
+    if not p:
+        return ERR + "Unknown port."
+    st["ports"].remove(p)
+    _fw_ports(p, False)
+    return f"Port {port} removed."
+
+
+def op_import_token(st, tok):
+    if st["role"] != "iran":
+        return ERR + "Token import is for the Iran server."
+    try:
+        d = parse_token(tok)
+        assert d["transports"]
+    except Exception:
+        return ERR + "Invalid token."
+    old = {t["id"]: t for t in st["transports"]}
+    order = [t["id"] for t in st["transports"]]
+    new = [dict(t) for t in d["transports"]]
+    new.sort(key=lambda t: order.index(t["id"]) if t["id"] in order else 999)
+    for t in new:
+        t["enabled"] = old[t["id"]]["enabled"] if t["id"] in old else True
+    if not any(t["enabled"] for t in new):
+        new[0]["enabled"] = True
+    st.update({"foreign_ip": d["foreign_ip"], "iran_ip": d["iran_ip"], "auth": d["auth"],
+               "sni": d.get("sni", ""), "secure": d.get("secure", True),
+               "transports": new, "l3": d.get("l3", {})})
+    dropped = [p["port"] for p in st.get("ports", []) if p.get("via") and p["via"] not in st["l3"]]
+    for p in st.get("ports", []):
+        if p.get("via") and p["via"] not in st["l3"]:
+            p.pop("via")  # its kernel carrier was deleted on the foreign server: fall back to the pool
+    save(st)
+    sh("systemctl restart night-tunnel-l3")
+    msg = f"Token synced: {len(new)} transports from the foreign server."
+    if dropped:
+        msg += f" Ports {dropped} lost their kernel carrier and now use the relay pool."
+    return msg
+
+
+def op_update_tunnel(st, foreign_ip="", iran_ip="", sni="", rotate=False):
+    """Update tunnel settings in place: server IPs (e.g. after getting a new IP), the decoy SNI, and
+    (foreign only) rotate the relay credentials + WireGuard keys. Ports/transports are kept."""
+    out = []
+    if foreign_ip and not valid_ip(foreign_ip) or iran_ip and not valid_ip(iran_ip):
+        return ERR + "Invalid IP."
+    if sni and not valid_host(sni):
+        return ERR + "Invalid SNI."
+    if rotate and st["role"] != "foreign":
+        return ERR + "Rotating keys is done on the foreign server, then use Sync token here."
+    ip_proto = [c for c in (st.get("l3") or {}) if c in IPPROTO]
+    for c in ip_proto:
+        fw_carrier(st, c, False)  # protocol rules are tied to the old peer IP
+    if foreign_ip and foreign_ip != st["foreign_ip"]:
+        out.append(f"foreign IP {st['foreign_ip']} -> {foreign_ip}")
+        st["foreign_ip"] = foreign_ip
+    if iran_ip and iran_ip != st["iran_ip"]:
+        out.append(f"Iran IP {st['iran_ip']} -> {iran_ip}")
+        st["iran_ip"] = iran_ip
+    for c in ip_proto:
+        fw_carrier(st, c, True)
+    if sni and sni != st.get("sni"):
+        st["sni"] = sni
+        out.append(f"SNI -> {sni}")
+        if st["role"] == "foreign" and not st.get("le"):
+            make_cert("", sni)  # self-signed certificate follows the SNI
+            detached_panel_restart()
+    if rotate:
+        st["auth"] = {"u": "u" + rnd(6), "p": rnd(20)}
+        for c in (st.get("l3") or {}).values():
+            if "f_priv" in c:
+                c["f_priv"], c["f_pub"] = wg_keypair()
+                c["i_priv"], c["i_pub"] = wg_keypair()
+        out.append("credentials and WireGuard keys rotated")
+    if not out:
+        return "Nothing changed."
+    save(st)
+    sh("systemctl restart night-tunnel-l3")
+    tail = (" Copy the new token to the Iran server (Sync token)." if st["role"] == "foreign"
+            else " Make the same change on the foreign server (Update tunnel), then Sync token.")
+    return "Tunnel updated: " + "; ".join(out) + "." + tail
+
+
+def detached_panel_restart():
+    sh("systemd-run --no-block --collect sh -c 'sleep 2; systemctl restart night-tunnel-panel'")
+
+
+# ------------------------------------------------------------ tunnel tester
+# Foreign server : a tiny authenticated bench server (inside the panel process) on 127.0.0.1:<bench_port>.
+# Iran server    : for every transport a throw-away gost client is pointed at that bench server through
+#                  the real transport; kernel carriers are tested with ping + a TCP bench over the link.
+BENCH = BASE + "/bench.json"
+BENCH_STATE = {"running": False, "log": []}
+STEALTH = {"wss", "mwss", "tls", "mtls", "grpc", "h2", "ws", "mws", "otls", "ohttp"}
+
+
+def bench_port(st):
+    h = hashlib.sha256(("nt-bench" + st["auth"]["p"]).encode()).digest()
+    return 20000 + int.from_bytes(h[:2], "big") % 40000
+
+
+def _mac(key, mode, n, ts):
+    return hmac.new(key.encode(), f"{mode}:{n}:{ts}".encode(), hashlib.sha256).hexdigest()[:32]
+
+
+def bench_conn(c):
+    try:
+        key = load()["auth"]["p"]
+        c.settimeout(30)
+        f = c.makefile("rb")
+        parts = f.readline(200).decode(errors="ignore").split()
+        if len(parts) != 5 or parts[0] != "NTB":
+            return
+        mode, n, ts, mac = parts[1], int(parts[2]), int(parts[3]), parts[4]
+        if abs(time.time() - ts) > 3600 or not hmac.compare_digest(mac, _mac(key, mode, n, ts)):
+            return
+        if mode == "ping":
+            while f.read(1):
+                c.sendall(b"K")
+        elif mode == "down":
+            blk, sent, end = os.urandom(65536), 0, time.time() + 30
+            while sent < min(n, 1 << 29) and time.time() < end:
+                c.sendall(blk)
+                sent += len(blk)
+        elif mode == "up":
+            left = min(n, 1 << 28)
+            while left > 0:
+                b = f.read(min(65536, left))
+                if not b:
+                    break
+                left -= len(b)
+            c.sendall(b"K")
+    except Exception:
+        pass
+    finally:
+        c.close()
+
+
+def bench_serve(st):
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        s.bind(("127.0.0.1", bench_port(st)))
+    except OSError:
+        return
+    s.listen(16)
+    gate = threading.BoundedSemaphore(8)
+
+    def one(c):
+        with gate:
+            bench_conn(c)
+    while True:
+        c, _ = s.accept()
+        threading.Thread(target=one, args=(c,), daemon=True).start()
+
+
+def _bench_open(host, port, key, mode, n, timeout):
+    s = socket.create_connection((host, port), timeout=timeout)
+    s.settimeout(timeout)
+    ts = int(time.time())
+    s.sendall(f"NTB {mode} {n} {ts} {_mac(key, mode, n, ts)}\n".encode())
+    return s
+
+
+def bench_latency(host, port, key, count=8, timeout=6):
+    t0 = time.time()
+    s = _bench_open(host, port, key, "ping", 0, timeout)
+    setup, rtts, lost = None, [], 0
+    try:
+        for _ in range(count):
+            a = time.time()
+            try:
+                s.sendall(b"x")
+                if not s.recv(1):
+                    raise OSError("closed")
+            except OSError:
+                lost += 1
+                if setup is None:
+                    break
+                continue
+            b = time.time()
+            if setup is None:
+                setup = (b - t0) * 1000
+            else:
+                rtts.append((b - a) * 1000)
+            time.sleep(0.05)
+    finally:
+        s.close()
+    if setup is None:
+        raise OSError("no reply through the tunnel")
+    rtts = rtts or [setup]
+    srt = sorted(rtts)
+    return {"ok": True, "setup": round(setup, 1), "rtt": round(srt[len(srt) // 2], 1),
+            "jitter": round(max(rtts) - min(rtts), 1), "loss": round(lost / count, 2)}
+
+
+def bench_down(host, port, key, secs):
+    s = _bench_open(host, port, key, "down", 1 << 29, 8)
+    got, t1, end = 0, None, None
+    try:
+        while True:
+            d = s.recv(262144)
+            if not d:
+                break
+            now = time.time()
+            if t1 is None:
+                t1, end = now, now + secs
+                continue
+            got += len(d)
+            if now >= end:
+                break
+    except OSError:
+        pass
+    finally:
+        s.close()
+    return round(got * 8 / max(time.time() - t1, 0.001) / 1e6, 1) if t1 else 0.0
+
+
+def bench_up(host, port, key, nbytes):
+    s = _bench_open(host, port, key, "up", nbytes, 25)
+    blk, sent = os.urandom(65536), 0
+    t0 = time.time()
+    try:
+        while sent < nbytes:
+            s.sendall(blk[:min(65536, nbytes - sent)])
+            sent += min(65536, nbytes - sent)
+        if not s.recv(1):
+            return 0.0
+    except OSError:
+        return 0.0
+    finally:
+        s.close()
+    return round(nbytes * 8 / max(time.time() - t0, 0.001) / 1e6, 1)
+
+
+def bench_speed(host, port, key, secs, r):
+    try:
+        r["down"] = bench_down(host, port, key, secs)
+    except OSError:
+        r["down"] = 0.0
+    n = int(min(max((r["down"] or 2) * 1e6 / 8 * secs, 262144), 48 << 20))
+    try:
+        r["up"] = bench_up(host, port, key, n)
+    except OSError:
+        r["up"] = 0.0
+
+
+def ping_host(ip, count=6):
+    out = sh(f"ping -n -c {count} -i 0.25 -W 2 {ip}").stdout
+    m = re.search(r"([\d.]+)% packet loss", out)
+    a = re.search(r"= [\d.]+/([\d.]+)/[\d.]+/([\d.]+)", out)
+    return {"loss": float(m.group(1)) / 100 if m else 1.0,
+            "rtt": float(a.group(1)) if a else None, "jitter": float(a.group(2)) if a else None}
+
+
+def bench_score(r):
+    if not r.get("ok"):
+        return 0.0
+    if "down" in r:
+        sp = max(((r.get("down") or 0) + (r.get("up") or 0)) / 2, 0.1)
+    else:
+        sp = 100.0 / (1 + r.get("jitter", 0) / 20)
+    return round(sp * (1 - r.get("loss", 0)) / (1 + r.get("rtt", 0) / 300), 2)
+
+
+def bench_recommend(st, res):
+    ok = [r for r in res if r.get("ok")]
+    bad = [r for r in res if not r.get("ok")]
+    lines, order = [], []
+    if not ok:
+        return {"lines": ["Nothing connected. Check that the foreign server runs the same version of this script "
+                          "(run Sync token after updating it), the firewall, and the server IPs."], "order": []}
+    relays = sorted([r for r in ok if r["kind"] == "relay"], key=lambda r: -r["score"])
+    order = [r["name"] for r in relays]
+    kern = sorted([r for r in ok if r["kind"] == "kernel"], key=lambda r: -r["score"])
+    if relays and "down" in relays[0]:
+        f = max(relays, key=lambda r: (r.get("down", 0) + r.get("up", 0)))
+        lines.append(f"Fastest relay: {f['name']} (down {f.get('down', 0)} / up {f.get('up', 0)} Mbps).")
+    lat = min(ok, key=lambda r: (r.get("rtt") or 9e9))
+    lines.append(f"Lowest latency (gaming / voice): {lat['name']} ({lat.get('rtt')} ms).")
+    stab = min(ok, key=lambda r: (r.get("loss", 0), r.get("jitter") or 9e9))
+    lines.append(f"Most stable (least loss/jitter): {stab['name']}.")
+    by_id = {t["id"]: t for t in st["transports"]}
+    stealth = [r for r in relays if r["name"] in by_id and by_id[r["name"]]["via"] == "direct"
+               and ttype(by_id[r["name"]]) in STEALTH]
+    if stealth:
+        lines.append(f"Best stealth (looks like TLS/web traffic): {stealth[0]['name']}.")
+    if kern and relays and kern[0]["score"] > 1.3 * relays[0]["score"]:
+        kn = kern[0]["name"].replace("kernel:", "")
+        lines.append(f"Kernel tunnel {kn} is clearly faster than any relay: forward heavy ports over it "
+                     f"(Ports -> path 'kernel: {kn}'). Caveat: no obfuscation, DPI can fingerprint it.")
+    elif kern:
+        lines.append("Kernel tunnels work but are not faster than the best relay; keep them as backup.")
+    opened = [r["name"] for r in ok if r.get("auth") == "OPEN"]
+    if opened:
+        lines.append("WARNING: these tunnels accepted a WRONG password (login not enforced): "
+                     + ", ".join(opened) + ". Rotate credentials (Update tunnel) and re-test.")
+    elif st.get("secure", True) and any(r.get("auth") == "enforced" for r in ok):
+        lines.append("Password check passed: connects with the right password, refused with a wrong one.")
+    elif not st.get("secure", True):
+        lines.append("No-password mode: nothing to verify; the foreign server limits relay ports to the Iran IP.")
+    plain = [r["name"] for r in ok if r.get("enc") == "no"]
+    if plain:
+        lines.append("Not encrypted (plain payload): " + ", ".join(plain) + ".")
+    if bad:
+        lines.append("Did not connect: " + ", ".join(r["name"] for r in bad)
+                     + " (blocked, filtered, disabled on the foreign server, or UDP dropped on this path).")
+    lines.append("Suggested priority (failover order): " + ", ".join(order) if order else "")
+    return {"lines": [x for x in lines if x], "order": order}
+
+
+def run_bench(st, full=True, secs=4, log=print):
+    """Run from the Iran server. Returns (report, error)."""
+    if st["role"] != "iran":
+        return None, ERR + "Run the tunnel test on the Iran server (the entry side)."
+    key, bp = st["auth"]["p"], bench_port(st)
+    gostbin = shutil.which("gost") or "/usr/local/bin/gost"
+    secure = is_secure(st)
+    used, local, bad, svcs, chains = {bp, st["panel"]["port"]}, {}, {}, [], []
+
+    def add_chain(cn, node, port):
+        chains.append({"name": cn, "hops": [{"name": "h", "nodes": [node]}]})
+        svcs.append({"name": "s-" + cn, "addr": f"127.0.0.1:{port}",
+                     "handler": {"type": "tcp", "chain": cn}, "listener": {"type": "tcp"},
+                     "forwarder": {"nodes": [{"name": "t", "addr": f"127.0.0.1:{bp}"}]}})
+    for t in st["transports"]:
+        local[t["id"]] = free_port(used)
+        add_chain("c-" + t["id"], dial_node(st, t), local[t["id"]])
+        if secure:  # same transport, WRONG password: the foreign server must refuse it
+            bad[t["id"]] = free_port(used)
+            node = dial_node(st, t)
+            node["name"] += "-bad"
+            node["connector"] = {"type": "relay", "auth": {"username": st["auth"]["u"],
+                                                           "password": "wrong-" + rnd(10)}}
+            add_chain("w-" + t["id"], node, bad[t["id"]])
+    res, proc = [], None
+    cfg = BASE + "/test-gost.json"
+    try:
+        if svcs:
+            with open(cfg, "w") as f:
+                json.dump({"log": {"level": "error"}, "services": svcs, "chains": chains}, f)
+            os.chmod(cfg, 0o600)
+            proc = subprocess.Popen([gostbin, "-C", cfg], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            for _ in range(50):
+                if all(not can_bind(p) for p in list(local.values()) + list(bad.values())) \
+                        or proc.poll() is not None:
+                    break
+                time.sleep(0.1)
+            if proc.poll() is not None:
+                return None, ERR + "Could not start the test engine (is gost installed?)."
+        log(f"Checking connectivity of {len(local)} transports...")
+
+        def lat(t):
+            try:
+                return bench_latency("127.0.0.1", local[t["id"]], key)
+            except (OSError, ValueError) as e:
+                return {"ok": False, "err": str(e) or e.__class__.__name__}
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
+            lats = list(ex.map(lat, st["transports"]))
+        for t, r in zip(st["transports"], lats):
+            r.update(name=t["id"], kind="relay", enc=enc_of(t),
+                     layer="L3 relay" if t["via"] != "direct" else "relay")
+            res.append(r)
+        # password check: right password connected above; the wrong one must be rejected
+        by_tid = {t["id"]: t for t in st["transports"]}
+        if secure:
+            log("Password check (wrong password must be refused)...")
+
+            def chk(r):
+                if not r["ok"]:
+                    return "-"
+                try:
+                    bench_latency("127.0.0.1", bad[r["name"]], key, count=1, timeout=4)
+                    return "OPEN"      # connected with a wrong password: login is NOT enforced
+                except (OSError, ValueError):
+                    return "enforced"
+            with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
+                for r, a in zip(res, list(ex.map(chk, res))):
+                    r["auth"] = a
+        else:
+            for r in res:
+                r["auth"] = "no password" if r["ok"] else "-"
+        for r in res:
+            if r["ok"] and full:
+                log(f"Speed test: {r['name']} ...")
+                bench_speed("127.0.0.1", local[r["name"]], key, secs, r)
+        for name, c in (st.get("l3") or {}).items():
+            log(f"Kernel tunnel {name}: ping + TCP ...")
+            pg = ping_host(c["f_ip"])
+            r = {"name": "kernel:" + name, "kind": "kernel", "layer": "L3 kernel", "ok": False,
+                 "enc": "yes" if name == "wg" else "no", "auth": "key" if name == "wg" else "none"}
+            try:
+                r.update(bench_latency(c["f_ip"], bp, key))
+                r["loss"] = max(r["loss"], round(pg["loss"], 2))
+                if full:
+                    bench_speed(c["f_ip"], bp, key, secs, r)
+            except OSError as e:
+                r["err"] = ("ping ok but TCP failed (update + restart the foreign side)" if pg["loss"] < 1
+                            else str(e) or "no reply")
+            r["ping_ms"] = pg["rtt"]
+            res.append(r)
+    finally:
+        if proc and proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+        if os.path.exists(cfg):
+            os.remove(cfg)
+    for r in res:
+        r["score"] = bench_score(r)
+    rep = {"ts": int(time.time()), "full": full, "results": res}
+    rep["rec"] = bench_recommend(st, res)
+    with open(BENCH, "w") as f:
+        json.dump(rep, f)
+    return rep, None
+
+
+def bench_table(rep):
+    out = [f"{'TUNNEL':14}{'LAYER':11}{'STATE':7}{'RTT ms':8}{'JITTER':8}{'LOSS':6}{'DOWN Mb/s':11}{'UP Mb/s':9}"
+           f"{'ENC':5}{'PASSWORD':12}SCORE"]
+    for r in sorted(rep["results"], key=lambda r: -r["score"]):
+        if r["ok"]:
+            out.append(f"{r['name']:14}{r['layer']:11}{'OK':7}{r['rtt']:<8}{r['jitter']:<8}{r['loss']:<6}"
+                       f"{r.get('down', '-'):<11}{r.get('up', '-'):<9}{r.get('enc', '-'):5}"
+                       f"{r.get('auth', '-'):12}{r['score']}")
+        else:
+            out.append(f"{r['name']:14}{r['layer']:11}{'FAIL':7}{r.get('err', '')}")
+    return "\n".join(out)
+
+
+def op_bench_apply(st, rep=None):
+    """Make the tester's suggested order the active priority (working relays only, failover mode)."""
+    if rep is None:
+        try:
+            rep = json.load(open(BENCH))
+        except (OSError, ValueError):
+            return ERR + "Run the tunnel test first."
+    order = rep.get("rec", {}).get("order") or []
+    msg = op_set_ids(st, order)
+    if not msg.startswith(ERR):
+        st["strategy"] = "fifo"
+    return msg
+
+
+def bench_bg(st, full):
+    BENCH_STATE.update(running=True, log=[])
+    try:
+        _, err = run_bench(st, full=full, log=lambda m: BENCH_STATE["log"].append(m))
+        if err:
+            BENCH_STATE["log"].append(err)
+    except Exception as e:  # never let the panel thread die silently
+        BENCH_STATE["log"].append(ERR + f"Test failed: {e}")
+    finally:
+        BENCH_STATE["running"] = False
+
+
+# ------------------------------------------------- update / reset / uninstall
+def remote_version():
+    try:
+        raw = open(OPT + "/repo").read().strip()
+    except OSError:
+        return None
+    r = sh(f"curl -fsSL --max-time 10 {shlex.quote(raw + '/nt.py')}")
+    m = re.search(r'^VERSION = "([^"]+)"', r.stdout, re.M)
+    return m.group(1) if m else None
+
+
+def update_script():
+    try:
+        raw = open(OPT + "/repo").read().strip()
+    except OSError:
+        return ERR + "Repo URL unknown; reinstall with the one-line command."
+    tmp = OPT + "/nt.py.new"
+    if sh(f"curl -fsSL --max-time 30 {shlex.quote(raw + '/nt.py')} -o {tmp}").returncode != 0:
+        return ERR + "Download failed."
+    try:
+        src = open(tmp).read()
+        ast.parse(src)
+        assert 'NAME = "night-tunnel"' in src
+    except Exception:
+        os.remove(tmp)
+        return ERR + "Downloaded file is invalid; kept the current version."
+    m = re.search(r'^VERSION = "([^"]+)"', src, re.M)
+    os.replace(tmp, OPT + "/nt.py")
+    os.chmod(OPT + "/nt.py", 0o700)
+    sh("systemd-run --no-block --collect sh -c 'sleep 2; systemctl restart night-tunnel-panel'")
+    return f"Script updated {VERSION} -> {m.group(1) if m else '?'}. Panel restarts in a moment."
+
+
+def update_gost():
+    arch = {"x86_64": "amd64", "aarch64": "arm64", "arm64": "arm64", "armv7l": "armv7"}.get(os.uname().machine)
+    if not arch:
+        return ERR + "Unsupported architecture."
+    r = sh("curl -fsSL --max-time 20 https://api.github.com/repos/go-gost/gost/releases/latest")
+    try:
+        urls = [a["browser_download_url"] for a in json.loads(r.stdout)["assets"]]
+        url = next(u for u in urls if u.endswith(f"_linux_{arch}.tar.gz"))
+    except Exception:
+        return ERR + "Could not find a gost release (GitHub unreachable?)."
+    d = tempfile.mkdtemp()
+    try:
+        if sh(f"curl -fsSL --max-time 120 {shlex.quote(url)} -o {d}/g.tgz").returncode != 0:
+            return ERR + "gost download failed."
+        with tarfile.open(d + "/g.tgz") as tf:
+            data = tf.extractfile("gost").read()
+        before = sh("/usr/local/bin/gost -V").stdout.strip()
+        shutil.copy("/usr/local/bin/gost", "/usr/local/bin/gost.bak")
+        with open("/usr/local/bin/gost.new", "wb") as f:
+            f.write(data)
+        os.chmod("/usr/local/bin/gost.new", 0o755)
+        if sh("/usr/local/bin/gost.new -V").returncode != 0:
+            os.remove("/usr/local/bin/gost.new")
+            return ERR + "New gost binary does not run; kept the old one."
+        os.replace("/usr/local/bin/gost.new", "/usr/local/bin/gost")
+        sh("systemctl restart night-tunnel-gost")
+        after = sh("/usr/local/bin/gost -V").stdout.strip()
+        return f"gost updated: {before or '?'} -> {after or '?'} (backup: gost.bak)."
+    except Exception as e:
+        return ERR + f"gost update failed: {e}"
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def teardown(full=False, purge=False):
+    """Reset = delete the tunnel config (stay installed). full = remove everything."""
+    le = ""
+    try:
+        le = load().get("le", "")
+    except (OSError, ValueError):
+        pass
+    for s in ("night-tunnel-panel", "night-tunnel-gost", "night-tunnel-l3"):
+        sh(f"systemctl disable --now {s}")
+    l3_down()
+    fw_clear()
+    if le and valid_host(le):
+        sh(f"certbot delete --cert-name {shlex.quote(le)} --non-interactive")
+    if os.path.exists(HOOK):
+        os.remove(HOOK)
+    shutil.rmtree(BASE, ignore_errors=True)
+    if full:
+        op_tg_remove(purge)
+        for s in ("night-tunnel-panel", "night-tunnel-gost", "night-tunnel-l3"):
+            p = f"/etc/systemd/system/{s}.service"
+            os.path.exists(p) and os.remove(p)
+        for p in ("/usr/local/bin/night-tunnel", "/usr/local/bin/gost.bak") + (("/usr/local/bin/gost",) if purge else ()):
+            os.path.exists(p) and os.remove(p)
+        sh("systemctl daemon-reload")
+        shutil.rmtree(OPT, ignore_errors=True)
+
+
+def detached(*args):
+    sh(f"systemd-run --no-block --collect python3 {OPT}/nt.py {' '.join(args)}")
+
+
+# ------------------------------------------------------------- web panel
+CSS = """body{font-family:system-ui,sans-serif;background:#0d1117;color:#e6edf3;margin:0;padding:20px}
+.w{max-width:980px;margin:auto}h1{font-size:22px}h2{font-size:16px;margin-top:28px;color:#9db4ff}
+table{width:100%;border-collapse:collapse}td,th{padding:7px 9px;border-bottom:1px solid #222a35;text-align:left;font-size:14px}
+input,select,button,textarea{background:#161b22;color:#e6edf3;border:1px solid #30363d;border-radius:6px;padding:6px 9px;font-size:14px}
+button{cursor:pointer;background:#1f6feb;border-color:#1f6feb}button.d{background:#8b1a1a;border-color:#8b1a1a}
+.up{color:#3fb950}.down{color:#f85149}.udp{color:#d29922}.m{background:#163b24;padding:8px;border-radius:6px;margin:10px 0}.m.e{background:#4a1515}
+.card{background:#11161d;border:1px solid #222a35;border-radius:10px;padding:14px;margin-top:12px}textarea{width:100%;height:90px}"""
+
+LOGIN = """<!doctype html><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">
+<title>night-tunnel</title><style>%s</style><div class=w style="max-width:340px;margin-top:12vh">
+<h1>night-tunnel</h1>%s<form method=post action="login"><p><input name=u placeholder=user style="width:100%%"></p>
+<p><input name=p type=password placeholder=password style="width:100%%"></p><button>Login</button></form></div>"""
+
+
+def esc(x):
+    return html.escape(str(x))
+
+
+def form(action_vals, inner, confirm="", style="margin:0;display:inline"):
+    hid = "".join(f"<input type=hidden name={k} value='{esc(v)}'>" for k, v in action_vals.items())
+    oc = f" onsubmit=\"return confirm('{confirm}')\"" if confirm else ""
+    return f"<form method=post action=api style='{style}'{oc}>{hid}{inner}</form>"
+
+
+def render_bench(st):
+    h = "<div class=card><h2 style='margin-top:0'>Test tunnels (connection + speed + recommendation)</h2>"
+    if st["role"] != "iran":
+        return (h + "<p style='color:#8b949e'>Run the test from the <b>Iran</b> server's panel (the entry side). "
+                "This server answers the test automatically.</p></div>")
+    if BENCH_STATE["running"]:
+        last = BENCH_STATE["log"][-1] if BENCH_STATE["log"] else "starting"
+        h += f"<div class=m>Running: {esc(last)} (page refreshes by itself)</div>"
+    else:
+        err = next((x for x in reversed(BENCH_STATE["log"]) if x.startswith(ERR)), "")
+        if err:
+            h += f"<div class='m e'>{esc(err.lstrip(ERR))}</div>"
+        h += (form({"a": "test", "full": "1"}, "<button>Full test (connect + speed)</button>") + " "
+              + form({"a": "test", "full": "0"}, "<button>Quick test (connect + latency)</button>"))
+    try:
+        with open(BENCH) as f:
+            rep = json.load(f)
+    except (OSError, ValueError):
+        return h + "<p style='color:#8b949e'>No test run yet. Speed tests use real bandwidth for ~10s per tunnel.</p></div>"
+    rows = ""
+    for r in sorted(rep["results"], key=lambda r: -r["score"]):
+        if r["ok"]:
+            rows += (f"<tr><td><b>{esc(r['name'])}</b></td><td>{esc(r['layer'])}</td><td class=up>OK</td>"
+                     f"<td>{r['rtt']}</td><td>{r['jitter']}</td><td>{int(r['loss'] * 100)}%</td>"
+                     f"<td>{r.get('down', '-')}</td><td>{r.get('up', '-')}</td>"
+                     f"<td>{esc(r.get('enc', '-'))}</td>"
+                     f"<td class={'down' if r.get('auth') == 'OPEN' else 'up'}>{esc(r.get('auth', '-'))}</td>"
+                     f"<td>{r['score']}</td></tr>")
+        else:
+            rows += (f"<tr><td><b>{esc(r['name'])}</b></td><td>{esc(r['layer'])}</td><td class=down>FAIL</td>"
+                     f"<td colspan=8 style='color:#8b949e'>{esc(r.get('err', ''))}</td></tr>")
+    when = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(rep["ts"]))
+    h += (f"<p style='color:#8b949e'>Last run: {when}</p><table><tr><th>Tunnel</th><th>Layer</th><th>State</th>"
+          f"<th>RTT ms</th><th>Jitter</th><th>Loss</th><th>Down Mb/s</th><th>Up Mb/s</th>"
+          f"<th>Encrypted</th><th>Password</th><th>Score</th></tr>{rows}</table>"
+          "<h2>Recommendation</h2><ul>" + "".join(f"<li>{esc(x)}</li>" for x in rep["rec"]["lines"]) + "</ul>")
+    if rep["rec"]["order"] and not BENCH_STATE["running"]:
+        h += form({"a": "benchapply"}, "<button>Apply suggested order (enable only working tunnels)</button>",
+                  confirm="Enable only the working tunnels in the suggested order?")
+    return h + "</div>"
+
+
+def render_update(st):
+    f = st["role"] == "foreign"
+    return ("<div class=card><h2 style='margin-top:0'>Update tunnel settings</h2>"
+            + form({"a": "updtunnel"},
+                   f"foreign IP <input name=foreign_ip value='{esc(st['foreign_ip'])}' size=15> "
+                   f"Iran IP <input name=iran_ip value='{esc(st['iran_ip'])}' size=15> "
+                   f"SNI <input name=sni value='{esc(st.get('sni', ''))}' size=18> "
+                   + ("<label><input type=checkbox name=rotate> rotate credentials + WireGuard keys</label> " if f else "")
+                   + "<button>Update tunnel</button>", style="display:block")
+            + "<p style='color:#8b949e'>Use it after getting a new server IP or to rotate keys. "
+              + ("Then copy the new token to the Iran server." if f else "Make the same change on the foreign server, then Sync token.")
+            + "</p></div>")
+
+
+def render_dash(st, msg=""):
+    pr = probe_all(st)
+    svc = sh("systemctl is-active night-tunnel-gost").stdout.strip()
+    iran = st["role"] == "iran"
+    rows = ""
+    for i, t in enumerate(st["transports"]):
+        s = pr[t["id"]]
+        rows += (f"<tr><td><input type=checkbox name='en_{t['id']}' {'checked' if t['enabled'] else ''}></td>"
+                 f"<td><input name='pr_{t['id']}' value='{i + 1}' size=2></td>"
+                 f"<td><b>{esc(t['id'])}</b></td><td>{esc(desc(t))}</td>"
+                 f"<td>{t['port']}</td><td class={s}>{s}</td></tr>")
+    strat = "".join(f"<option value={v} {'selected' if st.get('strategy') == v else ''}>{l}</option>"
+                    for v, l in (("fifo", "Failover (priority order)"),
+                                 ("round", "Rotate (round-robin per connection)"),
+                                 ("rand", "Random per connection")))
+    o = [f"<!doctype html><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'>"
+         + ("<meta http-equiv=refresh content='4;url=./'>" if BENCH_STATE["running"] else "") +
+         f"<title>night-tunnel</title><style>{CSS}</style><div class=w>"
+         f"<h1>night-tunnel <small style='color:#8b949e'>({st['role']} &middot; v{VERSION})</small></h1>"
+         f"<div>Engine: <b class={'up' if svc == 'active' else 'down'}>{svc}</b></div>"]
+    if msg:
+        bad = msg.startswith(ERR)
+        o.append(f"<div class='m{' e' if bad else ''}'>{esc(msg.lstrip(ERR))}</div>")
+    o.append("<div class=card><h2 style='margin-top:0'>Transport pool</h2><form method=post action='api'>"
+             "<input type=hidden name=a value=save><table><tr><th>On</th><th>Prio</th><th>ID</th>"
+             "<th>Type</th><th>Port</th><th>State</th></tr>" + rows + "</table>"
+             f"<p>Mode: <select name=strategy>{strat}</select> <button>Save &amp; apply</button></p></form></div>")
+    o.append("<div class=card><h2 style='margin-top:0'>Presets</h2>"
+             + form({"a": "preset"}, "<button name=n value=balanced>Balanced + backup</button> "
+                    "<button name=n value=stealth>Stealth</button> <button name=n value=game>Gaming (UDP first)</button> "
+                    "<button name=n value=rotate>Rotate everything</button>") + "</div>")
+    o.append(render_security(st))
+    if iran:
+        prow = ""
+
+        def vsel(cur):
+            return ("<select name=via><option value=pool>relay pool</option>" + "".join(
+                f"<option value={k} {'selected' if cur == k else ''}>kernel: {CARRIERS[k][0]}</option>"
+                for k in (st.get("l3") or {})) + "</select>")
+        for p in st.get("ports", []):
+            sel = "".join(f"<option {'selected' if p['proto'] == x else ''}>{x}</option>" for x in ("tcp", "udp", "both"))
+            prow += ("<tr><td colspan=2>" + form({"a": "editport", "old": p["port"]},
+                     f"<input name=port value={p['port']} size=6> <select name=proto>{sel}</select> "
+                     f"remote <input name=target value='{p.get('target', '')}' placeholder='same' size=6> "
+                     f"path {vsel(p.get('via', ''))} <button>Save</button>")
+                     + "</td><td>" + form({"a": "delport", "port": p["port"]}, "<button class=d>Delete</button>",
+                                          confirm="Delete this port?") + "</td></tr>")
+        addf = form({"a": "addport"},
+                    "<p>Add: <input name=port placeholder=port size=7> <select name=proto><option>tcp</option>"
+                    "<option>udp</option><option>both</option></select> remote <input name=target placeholder=same size=6> "
+                    f"path {vsel('')} <button>Add</button></p>", style="display:block")
+        o.append("<div class=card><h2 style='margin-top:0'>Forwarded ports (Iran &rarr; foreign 127.0.0.1)</h2>"
+                 f"<table>{prow}</table>" + addf + "</div>")
+        o.append("<div class=card><h2 style='margin-top:0'>Sync token (after changes on the foreign server)</h2>"
+                 + form({"a": "importtoken"}, "<textarea name=token placeholder='NT1:...'></textarea><p><button>Import token</button></p>",
+                        style="display:block") + "</div>")
+    else:
+        trows = ""
+        for t in st["transports"]:
+            tt = ttype(t)
+            fields = f"port <input name=port value={t['port']} size=6> "
+            if t["via"] == "direct":
+                topts = "".join(f"<option {'selected' if k == tt else ''}>{k}</option>" for k in CATALOG)
+                fields = f"type <select name=new_type>{topts}</select> " + fields
+                if tt in TLS_DIALERS:
+                    fields += f"SNI <input name=sni value='{esc(t.get('sni', ''))}' placeholder=global size=14> "
+                if tt in WS_TYPES:
+                    fields += (f"path <input name=path value='{esc(t.get('path', ''))}' placeholder=/ws size=8> "
+                               f"host <input name=host value='{esc(t.get('host', ''))}' size=12> ")
+            edit = form({"a": "tpedit", "id": t["id"]}, fields + "<button>Save</button>")
+            dele = form({"a": "tpdel", "id": t["id"]}, "<button class=d>Delete</button>", confirm="Delete this tunnel?")
+            trows += f"<tr><td><b>{esc(t['id'])}</b></td><td>{edit}</td><td>{dele}</td></tr>"
+        og = ""
+        for layer, ids in LAYERS:
+            og += f"<optgroup label='{layer}'>" + "".join(
+                f"<option value={k}>{k} - {CATALOG[k][2] if k in CATALOG else CARRIERS[k][0] + ' (kernel)'}</option>"
+                for k in ids if k in CATALOG or (k in CARRIERS and k not in st.get('l3', {}))) + "</optgroup>"
+        add = form({"a": "tpadd"}, f"type <select name=id>{og}</select> name <input name=name placeholder='same as type' size=12> "
+                   "port <input name=port placeholder=random size=6> SNI <input name=sni size=12> "
+                   "path <input name=path size=7> host <input name=host size=10> <button>Build tunnel</button>",
+                   style="display:block")
+        o.append(f"<div class=card><h2 style='margin-top:0'>Tunnels: edit / delete / build</h2><table>{trows}</table>"
+                 f"<h2>Build a new tunnel</h2>{add}"
+                 "<p style='color:#8b949e'>You can build several tunnels of one type (give them different names / ports / SNI). "
+                 "Kernel tunnels (L3) are also usable as direct port paths on the Iran server. "
+                 "After any change, copy the token below to the Iran server (Sync token).</p></div>")
+        o.append("<div class=card><h2 style='margin-top:0'>Token for the Iran server</h2>"
+                 f"<textarea readonly>{esc(make_token(st))}</textarea></div>")
+    o.append(render_bench(st))
+    o.append(render_wiz_result())
+    o.append(render_tg(st))
+    o.append(render_update(st))
+    o.append("<div class=card><h2 style='margin-top:0'>Maintenance</h2>"
+             + form({"a": "checkver"}, "<button>Check for update</button>") + " "
+             + form({"a": "update_script"}, "<button>Update night-tunnel</button>", confirm="Update the script?") + " "
+             + form({"a": "update_gost"}, "<button>Update engine (gost)</button>", confirm="Update gost?") + " "
+             + form({"a": "restart"}, "<button>Restart tunnel</button>") + " "
+             + "<form method=post action='logout' style='display:inline'><button class=d>Logout</button></form></div>")
+    o.append("<div class=card style='border-color:#8b1a1a'><h2 style='margin-top:0;color:#f85149'>Danger zone</h2>"
+             "<p style='color:#8b949e'>Type <b>DELETE</b> to confirm.</p>"
+             + form({"a": "reset"}, "<input name=confirm size=8> <button class=d>Delete tunnel config (keep installed)</button>", style="display:block;margin-bottom:10px")
+             + form({"a": "uninstall"}, "<input name=confirm size=8> <label><input type=checkbox name=purge> also remove gost binary</label> "
+                    "<button class=d>Uninstall night-tunnel completely</button>", style="display:block") + "</div></div>")
+    return "".join(o)
+
+
+def load_any():
+    """State of the configured tunnel, or a stub ('new') when only the panel is up and no tunnel exists yet."""
+    try:
+        return load()
+    except (OSError, ValueError):
+        with open(BOOT) as f:
+            b = json.load(f)
+        return {"role": "new", "panel": b["panel"], "transports": [], "ports": [], "l3": {}}
+
+
+def wiz_bg(p):
+    WIZ.update(running=True, log=[], result=None, error="")
+    try:
+        res, err = easy_setup(p, lambda m: WIZ["log"].append(m))
+        WIZ["result"], WIZ["error"] = res, err.lstrip(ERR) if err else ""
+        if res:
+            start_bench(load())
+    except Exception as e:  # keep the panel alive whatever happens
+        WIZ["error"] = f"Setup failed: {e}"
+    finally:
+        WIZ["running"] = False
+
+
+def render_security(st):
+    h = "<div class=card><h2 style='margin-top:0'>Security mode</h2>"
+    if is_secure(st):
+        h += ("<p><b class=up>With password</b>: relay login required; TLS / QUIC / WireGuard tunnels are encrypted. "
+              "Plain tunnels (tcp, ws, kcp, udp, ...) are authenticated but carry data unencrypted.</p>")
+    else:
+        h += ("<p><b class=udp>No password</b>: no relay login. The foreign server only accepts the Iran server's IP "
+              f"({esc(st['iran_ip'])}); plain tunnels carry data unencrypted.</p>")
+    if st["role"] == "foreign":
+        h += form({"a": "security", "mode": "open" if is_secure(st) else "password"},
+                  "<button>" + ("Switch to NO password" if is_secure(st) else "Switch to password mode") + "</button>",
+                  confirm="Change the security mode? Then copy the new token to the Iran server.")
+    else:
+        h += "<p style='color:#8b949e'>Change it on the foreign server, then Sync token here.</p>"
+    return h + "</div>"
+
+
+def render_tg(st):
+    h = "<div class=card><h2 style='margin-top:0'>Telegram proxy (MTProto, fake-TLS)</h2>"
+    t = tg_status()
+    if t:
+        h += (f"<p>State: <b class={'up' if t['active'] == 'active' else 'down'}>{esc(t['active'])}</b> &middot; "
+              f"port {t['port']} &middot; cover domain {esc(t['host'])}</p>"
+              f"<p><a style='color:#9db4ff' href='{esc(t['links']['https'])}'>{esc(t['links']['https'])}</a></p>"
+              f"<textarea readonly style='height:60px'>{esc(t['links']['tg'])}</textarea><p>"
+              + form({"a": "tgrotate"}, "<button>New secret</button>", confirm="Old links will stop working. Continue?")
+              + " " + form({"a": "tgremove"}, "<button class=d>Remove proxy</button>", confirm="Remove the Telegram proxy?")
+              + "</p>")
+    else:
+        ip = st["panel"].get("host", "")
+        ip = ip if valid_ip(ip) else ""
+        h += (form({"a": "tgcreate"},
+                   f"server IP <input name=ip value='{esc(ip)}' size=15> port <input name=port value=443 size=5> "
+                   "cover domain <input name=host value='www.microsoft.com' size=18> <button>Create proxy</button>",
+                   style="display:block")
+              + "<p style='color:#8b949e'>Runs on this server, independent of the tunnels. Use a server that can "
+                "reach Telegram. You get a link to share.</p>")
+    return h + "</div>"
+
+
+def render_wiz_result():
+    r = WIZ.get("result")
+    if not r:
+        return ""
+    o = r["other_panel"]
+    h = ("<div class=card style='border-color:#238636'><h2 style='margin-top:0;color:#3fb950'>Easy setup finished</h2>"
+         f"<p>Forwarded ports: {esc(', '.join(map(str, r['ports'])))} (Iran &rarr; foreign 127.0.0.1:port)</p>"
+         f"<p>Other server's panel: <b>{esc(o['panel_url'])}</b><br>user <b>{esc(o['user'])}</b> "
+         f"password <b>{esc(o['pw'])}</b> <span style='color:#8b949e'>(shown once &mdash; save it)</span></p>")
+    if r.get("test"):
+        h += f"<pre style='overflow:auto'>{esc(r['test'])}</pre>"
+    return h + form({"a": "wizclear"}, "<button>Dismiss</button>") + "</div>"
+
+
+def render_wizard(st, msg=""):
+    run = WIZ["running"]
+    o = ["<!doctype html><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'>"
+         + ("<meta http-equiv=refresh content='4;url=./'>" if run else "")
+         + f"<title>night-tunnel</title><style>{CSS}</style><div class=w><h1>night-tunnel "
+           f"<small style='color:#8b949e'>(setup &middot; v{VERSION})</small></h1>"]
+    if msg:
+        bad = msg.startswith(ERR)
+        o.append(f"<div class='m{' e' if bad else ''}'>{esc(msg.lstrip(ERR))}</div>")
+    if WIZ["error"] and not run:
+        o.append(f"<div class='m e'>{esc(WIZ['error'])}</div>")
+    if run:
+        o.append("<div class=card><h2 style='margin-top:0'>Setting up...</h2><pre>" + esc("\n".join(WIZ["log"]))
+                 + "</pre><p style='color:#8b949e'>This page refreshes by itself. It can take a few minutes.</p></div>")
+    else:
+        fld = "style='width:100%;max-width:340px'"
+        f = form({"a": "wizard"},
+                 "<p>This server is the <select name=role><option value=iran>Iran (entry) server</option>"
+                 "<option value=foreign>foreign (exit) server</option></select></p>"
+                 f"<p>IP of the OTHER server<br><input name=remote_ip {fld} placeholder='203.0.113.10'></p>"
+                 f"<p>SSH port <input name=ssh_port value=22 size=5> user <input name=ssh_user value=root size=10></p>"
+                 f"<p>SSH password of the other server<br><input type=password name=ssh_pass {fld} autocomplete=off></p>"
+                 f"<p>or SSH key file on this server<br><input name=ssh_key {fld} placeholder='/root/.ssh/id_ed25519'></p>"
+                 "<p>Security <select name=mode><option value=password>With password (encrypted, recommended)</option>"
+                 "<option value=open>No password (limited to the Iran IP)</option></select></p>"
+                 f"<p>Ports to forward on the Iran server<br><input name=ports {fld} value=443 placeholder='443,2053'></p>"
+                 f"<p>Ports that also need UDP (optional)<br><input name=udp {fld}></p>"
+                 "<p><label><input type=checkbox name=force> overwrite an existing night-tunnel config on the other server</label></p>"
+                 "<p><button>Build the tunnel automatically</button></p>", style="display:block")
+        o.append("<div class=card><h2 style='margin-top:0'>Easy setup</h2>"
+                 "<p>Give the other server's IP and root SSH login. This server installs night-tunnel there, "
+                 "creates both sides of the tunnel and runs a first test. The SSH password is used once and not stored.</p>"
+                 + f + "</div>")
+    o.append(render_wiz_result())
+    o.append(render_tg(st))
+    o.append("<form method=post action='logout'><button class=d>Logout</button></form></div>")
+    return "".join(o)
+
+
+def render_page(st, msg=""):
+    return render_wizard(st, msg) if st["role"] == "new" else render_dash(st, msg)
+
+
+def tg_act(a, f):
+    """Telegram-proxy panel actions (work with or without a tunnel). Returns a message or None."""
+    if a == "tgcreate":
+        return op_tg_create(f.get("ip", ""), f.get("port", "443"), f.get("host", ""))
+    if a == "tgrotate":
+        return op_tg_rotate()
+    if a == "tgremove":
+        return op_tg_remove()
+    return None
+
+
+class Handler(BaseHTTPRequestHandler):
+    timeout = 15
+    server_version = "nginx"
+    sys_version = ""
+    sessions = {}
+    fails = {}
+
+    def log_message(self, *a):
+        pass
+
+    def reply(self, code, body="", ctype="text/html; charset=utf-8", extra=None):
+        b = body.encode()
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(b)))
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("Cache-Control", "no-store")
+        for k, v in (extra or {}).items():
+            self.send_header(k, v)
+        self.end_headers()
+        self.wfile.write(b)
+
+    def sub(self, st):
+        pre = "/" + st["panel"]["path"]
+        if self.path == pre:
+            return "/"
+        if self.path.startswith(pre + "/"):
+            return self.path[len(pre):].split("?")[0]
+        return None
+
+    def authed(self):
+        for part in self.headers.get("Cookie", "").split(";"):
+            k, _, v = part.strip().partition("=")
+            if k == "nts" and self.sessions.get(v, 0) > time.time():
+                return True
+        return False
+
+    def form(self):
+        n = min(int(self.headers.get("Content-Length") or 0), 65536)
+        return {k: v[0] for k, v in parse_qs(self.rfile.read(n).decode()).items()}
+
+    def do_GET(self):
+        st = load_any()
+        s = self.sub(st)
+        if s is None:
+            return self.reply(404, "Not Found", "text/plain")
+        if s == "/" and self.authed():
+            return self.reply(200, render_page(st))
+        self.reply(200, LOGIN % (CSS, ""))
+
+    def do_POST(self):
+        st = load_any()
+        s = self.sub(st)
+        if s is None:
+            return self.reply(404, "Not Found", "text/plain")
+        f = self.form()
+        ip = self.client_address[0]
+        if s == "/login":
+            cnt, until = self.fails.get(ip, (0, 0))
+            if cnt >= 8 and until > time.time():
+                return self.reply(429, "Too many attempts", "text/plain")
+            p = st["panel"]
+            ok = hmac.compare_digest(f.get("u", ""), p["user"]) and hmac.compare_digest(
+                hash_pw(f.get("p", ""), p["salt"]), p["pass_hash"])
+            if not ok:
+                self.fails[ip] = (cnt + 1, time.time() + 300)
+                time.sleep(1)
+                return self.reply(200, LOGIN % (CSS, "<p class=down>Wrong credentials</p>"))
+            self.fails.pop(ip, None)
+            tok = secrets.token_urlsafe(32)
+            self.sessions[tok] = time.time() + 6 * 3600
+            return self.reply(303, "", extra={
+                "Location": "./", "Set-Cookie": f"nts={tok}; Path=/; HttpOnly; Secure; SameSite=Strict"})
+        if not self.authed():
+            return self.reply(303, "", extra={"Location": "./"})
+        if s == "/logout":
+            return self.reply(303, "", extra={"Location": "./", "Set-Cookie": "nts=; Max-Age=0; Path=/"})
+        if s != "/api":
+            return self.reply(404, "Not Found", "text/plain")
+        msg = self.act(st, f)
+        if msg == "BYE":
+            return self.reply(200, "<body style='background:#0d1117;color:#e6edf3;font-family:sans-serif;padding:30px'>"
+                                   "Removal started. The panel is going offline.")
+        st = load_any()
+        self.reply(200, render_page(st, msg))
+
+    def act_new(self, f):
+        """Actions while no tunnel exists yet (panel started first)."""
+        a = f.get("a")
+        if a == "wizard":
+            if WIZ["running"]:
+                return ERR + "Setup is already running."
+            p = {"local_role": f.get("role"), "remote_ip": f.get("remote_ip", "").strip(),
+                 "ssh_port": f.get("ssh_port", "22"), "ssh_user": f.get("ssh_user", "root").strip(),
+                 "ssh_pass": f.get("ssh_pass", ""), "ssh_key": f.get("ssh_key", "").strip(),
+                 "secure": f.get("mode") != "open", "force": "force" in f,
+                 "ports": parse_ports(f.get("ports", ""), f.get("udp", ""))}
+            threading.Thread(target=wiz_bg, args=(p,), daemon=True).start()
+            WIZ.update(running=True, log=["starting"], error="")
+            return "Setup started. This page refreshes by itself."
+        if a == "wizclear":
+            WIZ["result"] = None
+            return ""
+        return tg_act(a, f) or ""
+
+    def act(self, st, f):
+        a = f.get("a")
+        if st["role"] == "new":
+            return self.act_new(f)
+        if a in ("tgcreate", "tgrotate", "tgremove"):
+            return tg_act(a, f)
+        if a == "wizclear":
+            WIZ["result"] = None
+            return ""
+        if a == "save":
+            prio = {}
+            for t in st["transports"]:
+                t["enabled"] = ("en_" + t["id"]) in f
+                try:
+                    prio[t["id"]] = float(f.get("pr_" + t["id"], 99))
+                except ValueError:
+                    prio[t["id"]] = 99
+            st["transports"].sort(key=lambda t: prio[t["id"]])
+            if not any(t["enabled"] for t in st["transports"]):
+                return ERR + "Enable at least one transport."
+            if f.get("strategy") in ("fifo", "round", "rand"):
+                st["strategy"] = f["strategy"]
+            msg = "Saved."
+        elif a == "preset" and f.get("n") in ("balanced", "stealth", "game", "rotate"):
+            preset(st, f["n"])
+            msg = "Preset applied: " + f["n"]
+        elif a == "addport":
+            msg = op_port_add(st, f.get("port"), f.get("proto", "tcp"), f.get("target", ""), f.get("via", ""))
+        elif a == "editport":
+            msg = op_port_edit(st, f.get("old"), f.get("port"), f.get("proto", "tcp"), f.get("target", ""),
+                               f.get("via", ""))
+        elif a == "delport":
+            msg = op_port_del(st, f.get("port"))
+        elif a == "tpport":
+            msg = op_tp_port(st, f.get("id"), f.get("port"))
+        elif a == "tpdel":
+            msg = op_tp_del(st, f.get("id"))
+        elif a == "tpadd":
+            msg = op_tp_add(st, f.get("id"), f.get("name", ""), f.get("port", ""), f.get("sni", ""),
+                            f.get("path", ""), f.get("host", ""))
+        elif a == "tpedit":
+            msg = op_tp_edit(st, f.get("id"), f.get("port", ""), f.get("sni"), f.get("path"), f.get("host"),
+                             f.get("new_type", ""))
+        elif a == "updtunnel":
+            msg = op_update_tunnel(st, f.get("foreign_ip", ""), f.get("iran_ip", ""), f.get("sni", ""),
+                                   "rotate" in f)
+        elif a == "test":
+            if BENCH_STATE["running"]:
+                return ERR + "A test is already running."
+            if st["role"] != "iran":
+                return ERR + "Run the test on the Iran server."
+            threading.Thread(target=bench_bg, args=(dict(st), f.get("full") != "0"), daemon=True).start()
+            BENCH_STATE.update(running=True, log=["starting"])
+            return "Test started. This page refreshes by itself."
+        elif a == "benchapply":
+            msg = op_bench_apply(st)
+        elif a == "caradd":
+            msg = op_carrier_add(st, f.get("c"))
+        elif a == "security":
+            msg = op_security(st, f.get("mode") != "open")
+        elif a == "importtoken":
+            msg = op_import_token(st, f.get("token", ""))
+        elif a == "restart":
+            sh("systemctl restart night-tunnel-l3")
+            msg = "Restarted."
+        elif a == "checkver":
+            rv = remote_version()
+            return (f"Installed v{VERSION}, latest v{rv}." if rv else ERR + "Could not check (no repo URL / no access).")
+        elif a == "update_script":
+            return update_script()
+        elif a == "update_gost":
+            return update_gost()
+        elif a in ("reset", "uninstall"):
+            if f.get("confirm") != "DELETE":
+                return ERR + "Type DELETE to confirm."
+            if a == "reset":
+                detached("reset-yes")
+            else:
+                detached("uninstall-yes", "--purge" if f.get("purge") else "")
+            return "BYE"
+        else:
+            return ""
+        if msg.startswith(ERR):
+            return msg
+        save(st)
+        if not apply(st):
+            msg += " (nothing to run: add a port / enable a transport)"
+        return msg
+
+
+def run_panel():
+    st = load_any()
+    start_bench(st)
+    srv = ThreadingHTTPServer(("0.0.0.0", st["panel"]["port"]), Handler)
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+    ctx.load_cert_chain(CERT, KEY)
+    srv.socket = ctx.wrap_socket(srv.socket, server_side=True, do_handshake_on_connect=False)
+    srv.serve_forever()
+
+
+
+# ------------------------------------------------------ Telegram proxy (MTProto, fake-TLS)
+# Independent of the tunnels: any server can run it. Engine: mtg (https://github.com/9seconds/mtg).
+def tg_load():
+    try:
+        with open(TG_STATE) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def tg_secret(host):
+    """Fake-TLS secret: 'ee' + 16 random bytes + the cover hostname (all hex)."""
+    return "ee" + secrets.token_hex(16) + host.encode().hex()
+
+
+def tg_links(t):
+    q = f"server={t['ip']}&port={t['port']}&secret={t['secret']}"
+    return {"https": "https://t.me/proxy?" + q, "tg": "tg://proxy?" + q}
+
+
+def tg_install_engine():
+    """Install the mtg binary (GitHub release, or MTG_URL=<tar.gz link> for blocked servers)."""
+    if shutil.which("mtg"):
+        return ""
+    arch = {"x86_64": "amd64", "aarch64": "arm64", "arm64": "arm64", "armv7l": "arm"}.get(os.uname().machine)
+    if not arch:
+        return "Unsupported architecture."
+    url = os.environ.get("MTG_URL", "")
+    if not url:
+        r = sh("curl -fsSL --max-time 20 https://api.github.com/repos/9seconds/mtg/releases/latest")
+        try:
+            urls = [a["browser_download_url"] for a in json.loads(r.stdout)["assets"]]
+            url = next(u for u in urls if u.endswith(f"linux-{arch}.tar.gz"))
+        except Exception:
+            return "Could not find an mtg release (GitHub unreachable?). Retry with MTG_URL=<tar.gz link>."
+    d = tempfile.mkdtemp()
+    try:
+        if sh(f"curl -fsSL --max-time 120 {shlex.quote(url)} -o {d}/m.tgz").returncode != 0:
+            return "mtg download failed."
+        with tarfile.open(d + "/m.tgz") as tf:
+            m = next((x for x in tf.getmembers() if x.isfile() and os.path.basename(x.name) == "mtg"), None)
+            if not m:
+                return "mtg binary not found inside the archive."
+            data = tf.extractfile(m).read()
+        with open("/usr/local/bin/mtg", "wb") as f:
+            f.write(data)
+        os.chmod("/usr/local/bin/mtg", 0o755)
+        return "" if sh("/usr/local/bin/mtg --version").returncode == 0 else "The mtg binary does not run here."
+    except Exception as e:
+        return f"mtg install failed: {e}"
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def tg_write_cfg(t):
+    os.makedirs(TGBASE, exist_ok=True)
+    with open(TG_CFG, "w") as f:
+        f.write(f'secret = "{t["secret"]}"\nbind-to = "0.0.0.0:{t["port"]}"\n')
+    os.chmod(TG_CFG, 0o600)
+    with open(TG_STATE, "w") as f:
+        json.dump(t, f)
+    os.chmod(TG_STATE, 0o600)
+
+
+def tg_up(t):
+    tg_write_cfg(t)
+    write_units()
+    sh("systemctl daemon-reload")
+    sh("systemctl enable night-tunnel-tg")
+    sh("systemctl restart night-tunnel-tg")
+    time.sleep(1.5)
+    return sh("systemctl is-active night-tunnel-tg").stdout.strip() == "active"
+
+
+def op_tg_create(ip, port="", host="", reuse_port=False):
+    if not valid_ip(ip):
+        return ERR + "Enter this server's public IPv4 address."
+    host = host or "www.microsoft.com"
+    if not valid_host(host):
+        return ERR + "Invalid cover domain."
+    old = tg_load()
+    if port:
+        if not port.isdigit() or not 1 <= int(port) <= 65535:
+            return ERR + "Invalid port."
+        port = int(port)
+    else:
+        port = 443
+    stopped = bool(old and old["port"] == port)
+    if stopped:
+        sh("systemctl stop night-tunnel-tg")   # free our own port before checking it
+    if not can_bind(port):
+        if port == 443 and not old:
+            port = free_port(set())            # 443 busy: pick a free random port instead
+        else:
+            if stopped:
+                sh("systemctl start night-tunnel-tg")
+            return ERR + f"Port {port} is already in use."
+    if old and old["port"] != port:
+        _fw_apply(f"{old['port']}/tcp", False)
+    err = tg_install_engine()
+    if err:
+        return ERR + err
+    t = {"ip": ip, "port": port, "host": host, "secret": tg_secret(host)}
+    _fw_apply(f"{port}/tcp", True)
+    if not tg_up(t):
+        return ERR + "The proxy did not start. See: journalctl -u night-tunnel-tg -n 30"
+    return "Telegram proxy is running on port %d. Link: %s" % (port, tg_links(t)["https"])
+
+
+def op_tg_rotate():
+    t = tg_load()
+    if not t:
+        return ERR + "No Telegram proxy yet."
+    t["secret"] = tg_secret(t["host"])
+    if not tg_up(t):
+        return ERR + "The proxy did not restart."
+    return "New secret generated (old links stop working). Link: " + tg_links(t)["https"]
+
+
+def op_tg_remove(purge=False):
+    t = tg_load()
+    sh("systemctl disable --now night-tunnel-tg")
+    if t:
+        _fw_apply(f"{t['port']}/tcp", False)
+    p = "/etc/systemd/system/night-tunnel-tg.service"
+    os.path.exists(p) and os.remove(p)
+    sh("systemctl daemon-reload")
+    shutil.rmtree(TGBASE, ignore_errors=True)
+    if purge and os.path.exists("/usr/local/bin/mtg"):
+        os.remove("/usr/local/bin/mtg")
+    return "Telegram proxy removed."
+
+
+def tg_status():
+    t = tg_load()
+    if not t:
+        return None
+    t = dict(t)
+    t["active"] = sh("systemctl is-active night-tunnel-tg").stdout.strip()
+    t["links"] = tg_links(t)
+    return t
+
+
+def tg_menu():
+    need_root()
+    while True:
+        t = tg_status()
+        say("\n=== Telegram proxy (MTProto, fake-TLS) ===", G)
+        if t:
+            print(f"State : {t['active']}   Port: {t['port']}   Cover domain: {t['host']}")
+            print(f"Link  : {t['links']['https']}")
+            print(f"Also  : {t['links']['tg']}")
+            c = input("\na) new secret   b) change port / cover domain   c) logs   d) restart   e) remove   0) back : ").strip().lower()
+        else:
+            print("No proxy yet. It runs on THIS server and is independent of the tunnels.")
+            say("Tip: use a server that can reach Telegram (normally the foreign server).", Y)
+            c = "n" if ask("Create it now? (y/n)", "y") == "y" else "0"
+        if c == "0":
+            return
+        if c == "n":
+            ip = public_ip() or ask("This server's public IP")
+            port = ask("Port", "443")
+            host = ask("Cover domain for fake-TLS (a big real site)", "www.microsoft.com")
+            m = op_tg_create(ip, port, host)
+        elif c == "a":
+            m = op_tg_rotate()
+        elif c == "b":
+            m = op_tg_create(t["ip"], ask("Port", str(t["port"])), ask("Cover domain", t["host"]))
+        elif c == "c":
+            print(sh("journalctl -u night-tunnel-tg -n 40 --no-pager").stdout)
+            continue
+        elif c == "d":
+            sh("systemctl restart night-tunnel-tg")
+            m = "Restarted."
+        elif c == "e":
+            if ask("Type DELETE to remove the Telegram proxy") != "DELETE":
+                continue
+            m = op_tg_remove()
+        else:
+            continue
+        say(m.lstrip(ERR), R if m.startswith(ERR) else G)
+
+
+# ------------------------------------------------------------- systemd units
+UNITS = {
+    "night-tunnel-l3": """[Unit]
+Description=night-tunnel L3 carriers (WireGuard/GRE/VXLAN)
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=/etc/night-tunnel/state.json
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/python3 /opt/night-tunnel/nt.py l3-up
+ExecStop=/usr/bin/python3 /opt/night-tunnel/nt.py l3-down
+[Install]
+WantedBy=multi-user.target
+""",
+    "night-tunnel-gost": """[Unit]
+Description=night-tunnel engine (gost)
+After=network-online.target night-tunnel-l3.service
+Wants=night-tunnel-l3.service
+ConditionPathExists=/etc/night-tunnel/gost.json
+[Service]
+ExecStart=/usr/local/bin/gost -C /etc/night-tunnel/gost.json
+Restart=always
+RestartSec=3
+LimitNOFILE=1048576
+[Install]
+WantedBy=multi-user.target
+""",
+    "night-tunnel-panel": """[Unit]
+Description=night-tunnel web panel
+After=network-online.target
+ConditionPathExists=|/etc/night-tunnel/state.json
+ConditionPathExists=|/etc/night-tunnel/boot.json
+[Service]
+ExecStart=/usr/bin/python3 /opt/night-tunnel/nt.py panel
+Restart=always
+RestartSec=3
+[Install]
+WantedBy=multi-user.target
+""",
+}
+
+
+def write_units(names=None):
+    """Write the systemd units (the single source of truth; install.sh and the remote installer call this)."""
+    units = dict(UNITS)
+    units["night-tunnel-tg"] = f"""[Unit]
+Description=night-tunnel Telegram proxy (mtg)
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists={TG_CFG}
+[Service]
+ExecStart=/usr/local/bin/mtg run {TG_CFG}
+Restart=always
+RestartSec=3
+LimitNOFILE=1048576
+[Install]
+WantedBy=multi-user.target
+"""
+    for n, body in units.items():
+        if names and n not in names:
+            continue
+        with open(f"/etc/systemd/system/{n}.service", "w") as f:
+            f.write(body)
+    sh("systemctl daemon-reload")
+
+
+# ------------------------------------------------------------------ setup
+def enable_services():
+    sh("systemctl daemon-reload")
+    sh("systemctl enable --now night-tunnel-l3 night-tunnel-panel")
+    sh("systemctl enable night-tunnel-gost")
+    apply()
+
+
+def show_catalog():
+    for layer, ids in LAYERS:
+        print(f"  {layer}")
+        for i in ids:
+            print(f"      {i:8} {CATALOG[i][2] if i in CATALOG else CARRIERS[i][0] + ' (kernel)'}")
+
+
+def pick_tunnels():
+    """Let the user choose which tunnels to build. Returns (transport ids, carriers, custom?)."""
+    say("Tunnels you can build (by network layer):", Y)
+    show_catalog()
+    sel = ask("Pick ids, comma separated (e.g. wss,grpc,quic,wg) - 'all', or Enter for the recommended set", "")
+    if not sel:
+        return list(CATALOG), ["wg"], False
+    if sel == "all":
+        return list(CATALOG), list(CARRIERS), True
+    ids = [x for x in sel.replace(" ", "").split(",") if x]
+    tps = [i for i in ids if i in CATALOG]
+    car = [i for i in ids if i in CARRIERS]
+    if not tps and not car:
+        say("No valid ids; using the recommended set.", Y)
+        return list(CATALOG), ["wg"], False
+    return tps, car, True
+
+
+def pick_security():
+    say("Security mode:", Y)
+    print("  1) With password (recommended): relay login required; TLS / QUIC / WireGuard are encrypted")
+    print("  2) No password: no relay login. The foreign server then only accepts the Iran server's IP,")
+    print("     and plain transports (tcp/ws/kcp/udp/...) carry data unencrypted")
+    secure = ask("Choose", "1") != "2"
+    if not secure:
+        say("No-password mode selected: use encrypted transports (tls/mtls/wss/grpc/quic) for sensitive traffic.", Y)
+    return secure
+
+
+def _boot_panel():
+    """Panel config created by 'panel-init' (so the browser session survives the tunnel setup)."""
+    try:
+        with open(BOOT) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def _finish_setup(st, domain, sni, boot):
+    """Certificate + firewall + services shared by both roles."""
+    save(st)
+    if boot and boot.get("le") and os.path.exists(CERT) and not domain:
+        st["le"] = boot["le"]      # keep the panel's Let's Encrypt certificate
+    else:
+        st["le"] = domain if make_cert(domain, sni) else ""
+    save(st)
+
+
+def core_foreign(me, iran, domain, sni, tp_ids, carriers, custom, secure=True, reuse_panel=False):
+    """Create the foreign (exit) side. Non-interactive; returns (state, panel_password or None)."""
+    st = {"role": "foreign", "foreign_ip": me, "iran_ip": iran, "sni": sni, "secure": secure,
+          "auth": {"u": "u" + rnd(6), "p": rnd(20)}, "strategy": "fifo", "ports": []}
+    boot = _boot_panel() if reuse_panel else None
+    if boot:
+        st["panel"], pw = boot["panel"], None
+    else:
+        st["panel"], pw = new_panel(domain, me)
+    used = {st["panel"]["port"]}
+    st["transports"] = [{"id": k, "port": free_port(used), "enabled": CATALOG[k][3] or custom, "via": "direct"}
+                        for k in tp_ids]
+    st["l3"] = make_l3(carriers, st, used)
+    for c in carriers:
+        st["transports"].append({"id": c, "port": free_port(used), "enabled": True, "via": c})
+    if not custom:
+        preset(st, "balanced")
+    if not secure:  # no login: keep encrypted transports first, plain ones stay available but not default
+        for t in st["transports"]:
+            if enc_of(t) == "no" and t["via"] == "direct":
+                t["enabled"] = t["enabled"] and custom
+    _finish_setup(st, domain, sni, boot)
+    for t in st["transports"]:
+        if t["via"] == "direct":
+            fw_open(t["port"], "udp" if CATALOG[ttype(t)][1] else "tcp")
+    for c in st["l3"]:
+        fw_carrier(st, c, True)
+    fw_open(st["panel"]["port"], "tcp")
+    enable_services()   # also builds the gost config + the Iran-only lock in no-password mode
+    return st, pw
+
+
+def core_iran(d, domain, ports, reuse_panel=False):
+    """Create the Iran (entry) side from a token dict. Non-interactive; returns (state, panel_password)."""
+    me = public_ip() or d["iran_ip"]
+    st = {"role": "iran", "foreign_ip": d["foreign_ip"], "iran_ip": d["iran_ip"],
+          "sni": d.get("sni", ""), "auth": d["auth"], "strategy": "fifo", "secure": d.get("secure", True),
+          "transports": d["transports"], "l3": dict(d.get("l3", {})), "ports": ports}
+    boot = _boot_panel() if reuse_panel else None
+    if boot:
+        st["panel"], pw = boot["panel"], None
+    else:
+        st["panel"], pw = new_panel(domain, me)
+    _finish_setup(st, domain, st["sni"], boot)
+    for p in ports:
+        for pr in (["tcp", "udp"] if p["proto"] == "both" else [p["proto"]]):
+            fw_open(p["port"], pr)
+    fw_open(st["panel"]["port"], "tcp")
+    enable_services()
+    return st, pw
+
+
+def parse_ports(text, udp_text=""):
+    ports = []
+    for x in text.replace(" ", "").split(","):
+        if x.isdigit() and 1 <= int(x) <= 65535 and int(x) != 22 and all(p["port"] != int(x) for p in ports):
+            ports.append({"port": int(x), "proto": "tcp"})
+    for x in udp_text.replace(" ", "").split(","):
+        for p in ports:
+            if x.isdigit() and p["port"] == int(x):
+                p["proto"] = "both"
+    return ports
+
+
+def setup_foreign():
+    need_root()
+    say("== Setup FOREIGN (exit) server ==", G)
+    me = public_ip() or ask("This server's public IP")
+    iran = ask("Iran server public IP")
+    if not valid_ip(iran):
+        return say("Invalid IP.", R)
+    domain = ask("Domain pointing to this server (optional, for real SSL)")
+    if domain and not valid_host(domain):
+        return say("Invalid domain.", R)
+    sni = domain or ask("Decoy SNI for the TLS certificate", "www.microsoft.com")
+    secure = pick_security()
+    tp_ids, carriers, custom = pick_tunnels()
+    st, pw = core_foreign(me, iran, domain, sni, tp_ids, carriers, custom, secure, reuse_panel=True)
+    show_panel(st, pw)
+    say("\nPaste this token on the Iran server:\n", G)
+    print(make_token(st))
+
+
+def setup_iran():
+    need_root()
+    say("== Setup IRAN (entry) server ==", G)
+    try:
+        d = parse_token(ask("Token from the foreign server"))
+    except Exception:
+        return say("Invalid token.", R)
+    domain = ask("Domain pointing to this server (optional, for real SSL on the panel)")
+    if domain and not valid_host(domain):
+        return say("Invalid domain.", R)
+    ports = parse_ports(ask("Ports to forward, e.g. 443,2053,8443"),
+                        ask("Ports that also need UDP (comma separated, optional)"))
+    if not ports:
+        return say("No valid ports.", R)
+    st, pw = core_iran(d, domain, ports, reuse_panel=True)
+    show_panel(st, pw)
+    say("Tunnel is up. Each forwarded port P goes to 127.0.0.1:P on the foreign server.", G)
+
+
+# ------------------------------------------- easy mode: install the OTHER server over SSH
+# The beginner gives the other server's IP + SSH login; this server pushes itself there, installs the
+# dependencies and the engine, creates the matching side of the tunnel and wires both ends together.
+# The SSH password lives only in memory for the duration of the setup; nothing is written to disk.
+SSH_USER_RE = re.compile(r"^[a-z_][a-z0-9_-]{0,31}$")
+WIZ = {"running": False, "log": [], "result": None, "error": ""}
+
+
+class Remote:
+    def __init__(self, host, port=22, user="root", password="", key=""):
+        self.host, self.port, self.user, self.password, self.key = host, int(port), user, password, key
+
+    def _opts(self):
+        o = ["-o", "StrictHostKeyChecking=accept-new", "-o", "ConnectTimeout=12",
+             "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=8", "-o", "LogLevel=ERROR"]
+        if self.key:
+            o += ["-i", self.key, "-o", "IdentitiesOnly=yes", "-o", "BatchMode=yes"]
+        elif self.password:
+            o += ["-o", "PreferredAuthentications=password,keyboard-interactive", "-o", "PubkeyAuthentication=no"]
+        else:
+            o += ["-o", "BatchMode=yes"]
+        return o
+
+    def _go(self, argv, inp=None, timeout=900):
+        env = dict(os.environ)
+        if self.password and not self.key:
+            env["SSHPASS"] = self.password          # never on the command line
+            argv = ["sshpass", "-e"] + argv
+        try:
+            r = subprocess.run(argv, input=inp, capture_output=True, text=True, timeout=timeout, env=env)
+        except subprocess.TimeoutExpired:
+            return 255, "", "timed out"
+        except FileNotFoundError as e:
+            return 127, "", str(e)
+        return r.returncode, r.stdout, r.stderr
+
+    def run(self, cmd, inp=None, timeout=900):
+        return self._go(["ssh", "-p", str(self.port)] + self._opts() + [f"{self.user}@{self.host}", cmd],
+                        inp, timeout)
+
+    def put(self, src, dst):
+        return self._go(["scp", "-P", str(self.port)] + self._opts() + [src, f"{self.user}@{self.host}:{dst}"],
+                        None, 300)
+
+
+def ssh_explain(rc, err):
+    e = (err or "").strip()
+    if rc == 127:
+        return "ssh / sshpass is not installed on this server."
+    if "Permission denied" in e:
+        return ("SSH login refused: wrong password/key, or the other server does not allow root password "
+                "login (PermitRootLogin / PasswordAuthentication).")
+    if "Host key verification failed" in e:
+        return "The other server's SSH host key changed. Remove its line from ~/.ssh/known_hosts and retry."
+    if any(x in e for x in ("timed out", "No route", "refused", "unreachable")):
+        return "Cannot reach the other server over SSH (check IP, SSH port and its firewall)."
+    return "SSH failed: " + (e[-300:] or "unknown error")
+
+
+def ensure_ssh_tools(need_pass):
+    want = ["ssh", "scp"] + (["sshpass"] if need_pass else [])
+    if all(shutil.which(x) for x in want):
+        return True
+    sh("DEBIAN_FRONTEND=noninteractive apt-get install -y openssh-client sshpass")
+    return all(shutil.which(x) for x in want)
+
+
+def install_gost():
+    """Install the gost engine (GitHub release, or GOST_URL=<tar.gz link>). Returns '' or an error text."""
+    if shutil.which("gost"):
+        return ""
+    arch = {"x86_64": "amd64", "aarch64": "arm64", "arm64": "arm64", "armv7l": "armv7"}.get(os.uname().machine)
+    if not arch:
+        return "Unsupported architecture."
+    url = os.environ.get("GOST_URL", "")
+    if not url:
+        r = sh("curl -fsSL --max-time 20 https://api.github.com/repos/go-gost/gost/releases/latest")
+        try:
+            url = next(a["browser_download_url"] for a in json.loads(r.stdout)["assets"]
+                       if a["browser_download_url"].endswith(f"_linux_{arch}.tar.gz"))
+        except Exception:
+            return "Could not find a gost release (GitHub unreachable? set GOST_URL=<tar.gz link>)."
+    d = tempfile.mkdtemp()
+    try:
+        if sh(f"curl -fsSL --max-time 120 {shlex.quote(url)} -o {d}/g.tgz").returncode != 0:
+            return "gost download failed."
+        with tarfile.open(d + "/g.tgz") as tf:
+            data = tf.extractfile("gost").read()
+        with open("/usr/local/bin/gost", "wb") as f:
+            f.write(data)
+        os.chmod("/usr/local/bin/gost", 0o755)
+        return ""
+    except Exception as e:
+        return f"gost install failed: {e}"
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def remote_prepare(r, log, force=False):
+    """Check the other server and install night-tunnel + dependencies + engine on it. Returns an error or ''."""
+    log(f"Connecting to {r.host} over SSH ...")
+    rc, out, err = r.run("id -u; uname -m; command -v apt-get >/dev/null && echo APT; "
+                         "command -v gost >/dev/null && echo GOST; "
+                         "[ -f /etc/night-tunnel/state.json ] && echo EXISTS; echo END")
+    if rc != 0 or "END" not in out:
+        return ERR + ssh_explain(rc, err)
+    lines = out.split()
+    if not lines or lines[0] != "0":
+        return ERR + "The SSH user on the other server must be root."
+    if "APT" not in lines:
+        return ERR + "The other server must be Debian/Ubuntu."
+    if "EXISTS" in lines and not force:
+        return ERR + ("The other server already has a night-tunnel configuration. "
+                      "Tick 'overwrite' to replace it, or remove it there first.")
+    arch = lines[1] if len(lines) > 1 else ""
+    log("Installing packages on the other server (1-2 minutes) ...")
+    rc, out, err = r.run("export DEBIAN_FRONTEND=noninteractive; apt-get update -y >/dev/null 2>&1; "
+                         "apt-get install -y python3 curl jq openssl iproute2 iptables wireguard-tools "
+                         "iputils-ping ca-certificates >/dev/null 2>&1 && mkdir -p /opt/night-tunnel /etc/night-tunnel")
+    if rc != 0:
+        return ERR + "Package installation failed on the other server (apt mirrors / internet?). " + err[-200:]
+    log("Copying night-tunnel ...")
+    rc, _, err = r.put(os.path.abspath(__file__), "/opt/night-tunnel/nt.py")
+    if rc != 0:
+        return ERR + "Copy failed: " + ssh_explain(rc, err)
+    try:
+        with open(OPT + "/repo") as f:
+            repo = f.read().strip()
+    except OSError:
+        repo = ""
+    rc, _, err = r.run("chmod 700 /opt/night-tunnel/nt.py && cat > /usr/local/bin/night-tunnel && "
+                       "chmod +x /usr/local/bin/night-tunnel" + (f" && echo {shlex.quote(repo)} > /opt/night-tunnel/repo" if repo else ""),
+                       inp='#!/bin/sh\nexec python3 /opt/night-tunnel/nt.py "$@"\n')
+    if rc != 0:
+        return ERR + "Could not install the launcher: " + err[-200:]
+    if "GOST" not in lines:
+        local_gost = shutil.which("gost")
+        if local_gost and os.uname().machine == arch:
+            log("Copying the engine (gost) from this server ...")
+            rc, _, err = r.put(local_gost, "/usr/local/bin/gost")
+            if rc == 0:
+                r.run("chmod 755 /usr/local/bin/gost")
+        else:
+            log("Downloading the engine (gost) on the other server ...")
+            rc, out, err = r.run("python3 /opt/night-tunnel/nt.py install-engine")
+            if rc != 0:
+                return ERR + "Engine install failed on the other server: " + (out + err)[-250:]
+    rc, _, err = r.run("python3 /opt/night-tunnel/nt.py install-units")
+    if rc != 0:
+        return ERR + "Could not create the services on the other server: " + err[-200:]
+    if "EXISTS" in lines and force:
+        r.run("python3 /opt/night-tunnel/nt.py reset-yes")
+    return ""
+
+
+def remote_configure(r, kind, params, log):
+    """Run the non-interactive setup of one side on the other server; returns (result dict, error)."""
+    log("Creating the tunnel on the other server ...")
+    rc, out, err = r.run(f"python3 /opt/night-tunnel/nt.py auto-{kind}", inp=json.dumps(params), timeout=600)
+    line = next((x for x in out.splitlines() if x.startswith("NT_RESULT:")), "")
+    if rc != 0 or not line:
+        return None, ERR + "Setup failed on the other server: " + (err or out)[-300:]
+    try:
+        return json.loads(base64.b64decode(line[10:])), ""
+    except ValueError:
+        return None, ERR + "Unreadable answer from the other server."
+
+
+def auto_cmd(kind):
+    """Non-interactive setup of one side (called over SSH by the other server): params on stdin."""
+    need_root()
+    try:
+        p = json.loads(sys.stdin.read())
+        if kind == "foreign":
+            assert valid_ip(p["me"]) and valid_ip(p["iran_ip"])
+            st, pw = core_foreign(p["me"], p["iran_ip"], "", p.get("sni") or "www.microsoft.com",
+                                  list(CATALOG), ["wg"], False, bool(p.get("secure", True)))
+            out = {"token": make_token(st)}
+        else:
+            d = parse_token(p["token"])
+            ports = [{"port": int(x["port"]), "proto": x["proto"] if x["proto"] in ("tcp", "udp", "both") else "tcp"}
+                     for x in p["ports"]]
+            assert ports
+            st, pw = core_iran(d, "", ports)
+            out = {}
+        out.update(panel_url=panel_url(st), user=st["panel"]["user"], pw=pw)
+    except Exception as e:
+        print("auto setup error:", e, file=sys.stderr)
+        sys.exit(1)
+    print("NT_RESULT:" + base64.b64encode(json.dumps(out).encode()).decode())
+
+
+_BENCH_THREAD = []
+
+
+def start_bench(st):
+    """The foreign panel process answers the tunnel tester; start it once (also right after a panel-driven setup)."""
+    if st["role"] == "foreign" and not _BENCH_THREAD:
+        t = threading.Thread(target=bench_serve, args=(st,), daemon=True)
+        t.start()
+        _BENCH_THREAD.append(t)
+
+
+def easy_setup(p, log):
+    """Build the whole tunnel from THIS server: also installs and configures the other server over SSH.
+    p: local_role (iran|foreign), remote_ip, ssh_port, ssh_user, ssh_pass | ssh_key, secure, ports (list),
+       local_ip (optional), force (overwrite the other server's old config).
+    Returns (result dict, error)."""
+    role = p.get("local_role")
+    if role not in ("iran", "foreign"):
+        return None, ERR + "Choose whether this server is the Iran or the foreign server."
+    if not valid_ip(p.get("remote_ip", "")):
+        return None, ERR + "Enter the other server's IPv4 address."
+    try:
+        port = int(p.get("ssh_port") or 22)
+        assert 1 <= port <= 65535
+    except (ValueError, AssertionError):
+        return None, ERR + "Invalid SSH port."
+    user = p.get("ssh_user") or "root"
+    if not SSH_USER_RE.match(user):
+        return None, ERR + "Invalid SSH user."
+    key = p.get("ssh_key") or ""
+    if key and not os.path.isfile(key):
+        return None, ERR + "SSH key file not found on this server."
+    if not key and not p.get("ssh_pass"):
+        return None, ERR + "Give the other server's SSH password (or a key file)."
+    ports = p.get("ports") or []
+    if not ports:
+        return None, ERR + "Enter at least one port to forward (e.g. 443)."
+    if os.path.exists(STATE):
+        return None, ERR + "This server already has a tunnel configured. Remove it first (menu 11), then retry."
+    me = p.get("local_ip") or public_ip()
+    if not valid_ip(me):
+        return None, ERR + "Could not detect this server's public IP; enter it."
+    if me == p["remote_ip"]:
+        return None, ERR + "The other server's IP is this server's own IP."
+    secure = bool(p.get("secure", True))
+    if not ensure_ssh_tools(not key):
+        return None, ERR + "Could not install ssh / sshpass on this server."
+    r = Remote(p["remote_ip"], port, user, "" if key else p["ssh_pass"], key)
+    err = remote_prepare(r, log, bool(p.get("force")))
+    if err:
+        return None, err
+    result = {"role": role, "other_ip": p["remote_ip"], "secure": secure, "ports": [x["port"] for x in ports]}
+    if role == "iran":
+        res, err = remote_configure(r, "foreign", {"me": p["remote_ip"], "iran_ip": me, "secure": secure}, log)
+        if err:
+            return None, err
+        log("Creating this (Iran) server's side ...")
+        st, _ = core_iran(parse_token(res["token"]), "", ports, reuse_panel=True)
+        result["other_panel"] = {k: res.get(k) for k in ("panel_url", "user", "pw")}
+        log("Waiting a few seconds, then running a quick connection test ...")
+        time.sleep(6)
+        try:
+            rep, terr = run_bench(st, full=False, log=log)
+            result["test"] = bench_table(rep) if rep else terr.lstrip(ERR)
+            result["test_lines"] = rep["rec"]["lines"] if rep else []
+        except Exception as e:  # the tunnel is up either way; the test is a bonus
+            result["test"] = f"Test could not run: {e}"
+    else:
+        log("Creating this (foreign) server's side ...")
+        st, _ = core_foreign(me, p["remote_ip"], "", "www.microsoft.com", list(CATALOG), ["wg"], False,
+                             secure, reuse_panel=True)
+        start_bench(st)
+        res, err = remote_configure(r, "iran", {"token": make_token(st), "ports": ports}, log)
+        if err:
+            return None, err + " (This server's side is already created; remove it with menu 11 to retry.)"
+        result["other_panel"] = {k: res.get(k) for k in ("panel_url", "user", "pw")}
+        result["test"] = "Run the connection test on the Iran server (menu 13 or its panel)."
+    result["panel_url"] = panel_url(st)
+    result["user"] = st["panel"]["user"]
+    return result, ""
+
+
+def easy_menu():
+    need_root()
+    say("== Easy setup: build the whole tunnel from this server ==", G)
+    print("This server connects to the OTHER server over SSH, installs night-tunnel there and creates\n"
+          "both sides of the tunnel automatically. You only need the other server's IP and its root login.")
+    role = "iran" if ask("This server is the  1) Iran (entry) server   2) foreign (exit) server", "1") != "2" else "foreign"
+    p = {"local_role": role, "remote_ip": ask("IP of the OTHER server (" + ("foreign" if role == "iran" else "Iran") + ")")}
+    p["ssh_port"] = ask("SSH port of the other server", "22")
+    p["ssh_user"] = ask("SSH user (must be root)", "root")
+    p["ssh_key"] = ask("SSH private key file (empty = use a password)")
+    if not p["ssh_key"]:
+        p["ssh_pass"] = getpass.getpass("SSH password of the other server (hidden): ")
+    p["secure"] = pick_security()
+    p["ports"] = parse_ports(ask("Ports to forward on the Iran server, e.g. 443,2053"),
+                             ask("Ports that also need UDP (optional)"))
+    if not (public_ip() or "").strip():
+        p["local_ip"] = ask("This server's public IP")
+    if ask("Overwrite an existing night-tunnel config on the other server if it has one? (y/n)", "n") == "y":
+        p["force"] = True
+    res, err = easy_setup(p, lambda m: print("  " + m))
+    if err:
+        return say(err.lstrip(ERR), R)
+    say("\n=== Tunnel is up ===", G)
+    print(f"Forwarded ports (Iran -> foreign 127.0.0.1:P): {', '.join(map(str, res['ports']))}")
+    print(f"This server's panel : {res['panel_url']}  (user {res['user']}; password as when it was created)")
+    o = res["other_panel"]
+    print(f"Other server's panel: {o['panel_url']}\n  user {o['user']}  password {o['pw']}  (save it now)")
+    if res.get("test"):
+        print("\n" + res["test"])
+        for ln in res.get("test_lines", []):
+            print(" - " + ln)
+
+
+def panel_init():
+    """Start only the web panel (no tunnel yet) so the whole setup can be done from the browser."""
+    need_root()
+    if os.path.exists(STATE):
+        return say("A tunnel is already configured here; use menu 9 for the panel details.", Y)
+    if _boot_panel():
+        return say("The panel is already running; use menu 9 to see its URL.", Y)
+    domain = ask("Domain pointing to this server (optional, for real SSL)")
+    if domain and not valid_host(domain):
+        return say("Invalid domain.", R)
+    ip = public_ip() or ask("This server's public IP")
+    p, pw = new_panel(domain, ip)
+    os.makedirs(BASE, exist_ok=True)
+    boot = {"panel": p, "le": ""}
+
+    def put():
+        with open(BOOT, "w") as f:
+            json.dump(boot, f)
+        os.chmod(BOOT, 0o600)
+    put()
+    if make_cert(domain, "localhost"):
+        boot["le"] = domain
+        put()
+    fw_open(p["port"], "tcp")
+    write_units()
+    sh("systemctl enable --now night-tunnel-panel")
+    show_panel({"panel": p}, pw)
+    say("Open the panel in your browser: there you can set up the tunnel, or a Telegram proxy.", G)
+
+
+def show_panel(st, pw=None):
+    p = st["panel"]
+    say("\n=== Web panel ===", G)
+    print(f"URL      : {panel_url(st)}")
+    print(f"Username : {p['user']}")
+    print(f"Password : {pw if pw else '(unchanged: the one you got when the panel was created; menu 9 resets it)'}")
+
+
+def reset_panel():
+    st = load()
+    pw = rnd(16)
+    st["panel"]["salt"] = secrets.token_hex(16)
+    st["panel"]["pass_hash"] = hash_pw(pw, st["panel"]["salt"])
+    save(st)
+    sh("systemctl restart night-tunnel-panel")
+    show_panel(st, pw)
+
+
+def need_state():
+    try:
+        return load()
+    except (OSError, ValueError):
+        say("Not configured yet: run setup first (1 or 2).", R)
+        return None
+
+
+def commit(st, msg):
+    if msg.startswith(ERR):
+        say(msg[len(ERR):], R)
+        return
+    save(st)
+    if not apply(st):
+        msg += " (nothing to run yet)"
+    say(msg, G)
+
+
+def list_transports(st):
+    pr = probe_all(st)
+    print(f"{'#':3}{'ID':13}{'PORT':8}{'ON':5}{'STATE':7}TYPE")
+    for i, t in enumerate(st["transports"], 1):
+        print(f"{i:<3}{t['id']:13}{t['port']:<8}{'yes' if t['enabled'] else 'no':5}{pr[t['id']]:7}{desc(t)}")
+    print(f"Mode: {st.get('strategy', 'fifo')}   Security: "
+          + ("password (relay login)" if is_secure(st) else "NO PASSWORD (relay ports limited to the Iran IP)"))
+    if st["role"] == "iran" and kernel_ports(st):
+        print("Kernel-forwarded ports: " + ", ".join(f"{p['port']}->{p['via']}" for p in kernel_ports(st)))
+
+
+def transports_menu():
+    while True:
+        st = need_state()
+        if not st:
+            return
+        list_transports(st)
+        print("\na) set active + priority order   b) mode (fifo/round/rand)   c) preset"
+              "\nd) BUILD a tunnel: pick transport / kernel tunnel (foreign)"
+              "\ne) delete a tunnel (foreign)   f) change port (foreign)"
+              "\ng) add kernel carrier directly (foreign)"
+              "\nh) EDIT a tunnel: port / transport type / SNI / ws path / host"
+              "\n0) back")
+        c = input("Choose: ").strip().lower()
+        if c == "0":
+            return
+        if c == "a":
+            ids = ask("Transport ids in priority order, comma separated (others get disabled)")
+            commit(st, op_set_ids(st, [x.strip() for x in ids.split(",") if x.strip()]))
+        elif c == "b":
+            m = ask("Mode", st.get("strategy", "fifo"))
+            if m in ("fifo", "round", "rand"):
+                st["strategy"] = m
+                commit(st, "Mode: " + m)
+        elif c == "c":
+            n = ask("Preset (balanced/stealth/game/rotate)", "balanced")
+            if n in ("balanced", "stealth", "game", "rotate"):
+                preset(st, n)
+                commit(st, "Preset applied: " + n)
+        elif c == "d":
+            if st["role"] != "foreign":
+                say("Build tunnels on the foreign server, then Sync token here.", Y)
+                continue
+            show_catalog()
+            tid = ask("Type to build (id from the list)")
+            if tid in CARRIERS:
+                commit(st, op_carrier_add(st, tid))
+            else:
+                name = ask("Name for this tunnel (several of one type allowed)", tid)
+                port = ask("Port (empty = random)")
+                sni = ask("TLS SNI for this tunnel (empty = global)") if tid in TLS_DIALERS else ""
+                path = ask("WebSocket path (empty = default)") if tid in WS_TYPES else ""
+                host = ask("WebSocket Host header (empty = none)") if tid in WS_TYPES else ""
+                commit(st, op_tp_add(st, tid, name, port, sni, path, host))
+        elif c == "e":
+            commit(st, op_tp_del(st, ask("Delete which tunnel id")))
+        elif c == "f":
+            commit(st, op_tp_port(st, ask("Transport id"), ask("New port")))
+        elif c == "g":
+            commit(st, op_carrier_add(st, ask("Carrier (" + "/".join(CARRIERS) + ")")))
+        elif c == "h":
+            tid = ask("Tunnel id to edit")
+            t = find_tp(st, tid)
+            if not t:
+                say("Unknown tunnel.", R)
+                continue
+            say(f"Editing {tid} (empty = keep current, '-' = reset to default)", Y)
+            kw = {}
+            nt = ask("Transport type", ttype(t)) if t["via"] == "direct" else ""
+            if nt and nt != ttype(t):
+                kw["new_type"] = nt
+            p = ask("Port", str(t["port"]))
+            if p != str(t["port"]):
+                kw["port"] = p
+            if t["via"] == "direct":
+                eff = nt or ttype(t)
+                for key in ("sni", "path", "host"):
+                    if key == "sni" and eff not in TLS_DIALERS:
+                        continue
+                    if key != "sni" and eff not in WS_TYPES:
+                        continue
+                    v = ask(key.upper(), t.get(key, ""))
+                    if v != t.get(key, ""):
+                        kw[key] = "" if v == "-" else v
+            commit(st, op_tp_edit(st, tid, **kw))
+        if c in ("d", "e", "f", "g", "h") and st["role"] == "foreign":
+            say("Copy the new token to the Iran server:", Y)
+            print(make_token(st))
+
+
+def ports_menu():
+    while True:
+        st = need_state()
+        if not st:
+            return
+        if st["role"] != "iran":
+            return say("Ports are managed on the Iran server.", Y)
+        print(f"\n{'PORT':8}{'PROTO':8}{'REMOTE':8}PATH")
+        for p in st["ports"]:
+            print(f"{p['port']:<8}{p['proto']:8}{p.get('target', 'same'):<8}{'kernel:' + p['via'] if p.get('via') else 'relay pool'}")
+        kv = "/".join(["pool"] + list((st.get("l3") or {})))
+        c = input("\na) add   b) edit   c) delete   0) back : ").strip().lower()
+        if c == "0":
+            return
+        if c == "a":
+            commit(st, op_port_add(st, ask("Port"), ask("Protocol (tcp/udp/both)", "tcp"),
+                                   ask("Remote port (empty = same)"), ask(f"Path ({kv})", "pool")))
+        elif c == "b":
+            old = ask("Port to edit")
+            cur = next((p for p in st["ports"] if str(p["port"]) == old), {})
+            commit(st, op_port_edit(st, old, ask("New port", old), ask("Protocol (tcp/udp/both)", "tcp"),
+                                    ask("Remote port (empty = same)"),
+                                    ask(f"Path ({kv})", cur.get("via", "pool"))))
+        elif c == "c":
+            commit(st, op_port_del(st, ask("Port to delete")))
+
+
+def sync_menu():
+    st = need_state()
+    if not st:
+        return
+    if st["role"] == "foreign":
+        say("Token for the Iran server:", G)
+        print(make_token(st))
+    else:
+        commit(st, op_import_token(st, ask("Paste the new token from the foreign server")))
+
+
+def test_menu():
+    st = need_state()
+    if not st:
+        return
+    if st["role"] != "iran":
+        return say("Run the test on the Iran server (entry side). The foreign server answers automatically "
+                   "while its panel service is running.", Y)
+    need_root()
+    full = ask("Test type: 1) quick (connect + latency)  2) full (+ speed, ~10s per tunnel)", "2") != "1"
+    say("Running... (speed tests use real bandwidth; users on the tunnel may notice for a moment)", Y)
+    rep, err = run_bench(st, full=full, log=lambda m: print("  " + m))
+    if err:
+        return say(err.lstrip(ERR), R)
+    print("\n" + bench_table(rep))
+    say("\nRecommendation", G)
+    for ln in rep["rec"]["lines"]:
+        print(" - " + ln)
+    if rep["rec"]["order"] and ask("\nApply the suggested order now (enable only the working tunnels)? (y/n)", "n") == "y":
+        commit(st, op_bench_apply(st, rep))
+
+
+def security_menu():
+    st = need_state()
+    if not st:
+        return
+    print("Current mode: " + ("WITH password (relay login + encrypted transports)" if is_secure(st)
+                              else "NO password (relay ports limited to the Iran IP, plain transports unencrypted)"))
+    if st["role"] != "foreign":
+        return say("Change it on the foreign server, then Sync token here.", Y)
+    need_root()
+    secure = ask("Set mode: 1) with password  2) no password", "1" if is_secure(st) else "2") != "2"
+    commit(st, op_security(st, secure))
+    say("Copy the new token to the Iran server:", Y)
+    print(make_token(st))
+
+
+def update_tunnel_menu():
+    st = need_state()
+    if not st:
+        return
+    need_root()
+    print(f"Foreign IP: {st['foreign_ip']}   Iran IP: {st['iran_ip']}   SNI: {st.get('sni', '')}")
+    print("Empty = keep.")
+    kw = {"foreign_ip": ask("New foreign IP"), "iran_ip": ask("New Iran IP"), "sni": ask("New SNI")}
+    if st["role"] == "foreign":
+        kw["rotate"] = ask("Rotate credentials + WireGuard keys? (y/n)", "n") == "y"
+    commit(st, op_update_tunnel(st, **kw))
+    if st["role"] == "foreign":
+        say("Copy the new token to the Iran server:", Y)
+        print(make_token(st))
+
+
+def update_menu():
+    print(f"Installed: v{VERSION}")
+    rv = remote_version()
+    print(f"Latest   : {'v' + rv if rv else 'unknown (no repo URL / no access)'}")
+    c = input("a) update night-tunnel   b) update engine (gost)   0) back : ").strip().lower()
+    if c in ("a", "b"):
+        need_root()
+        m = update_script() if c == "a" else update_gost()
+        say(m.lstrip(ERR), R if m.startswith(ERR) else G)
+
+
+def remove_menu():
+    need_root()
+    print("a) Delete ALL tunnels / config (keep night-tunnel installed)\nb) Uninstall night-tunnel completely "
+          "(tunnels + script + services)\nc) Delete ONE tunnel (the others stay)\n0) back")
+    c = input("Choose: ").strip().lower()
+    if c == "c":
+        st = need_state()
+        if st:
+            list_transports(st)
+            commit(st, op_tp_del(st, ask("Tunnel id to delete")))
+            if st["role"] == "foreign":
+                say("Copy the new token to the Iran server:", Y)
+                print(make_token(st))
+        return
+    if c in ("a", "b"):
+        if ask("Type DELETE to confirm") != "DELETE":
+            return say("Cancelled.", Y)
+        purge = c == "b" and ask("Also remove the gost binary? (y/n)", "n") == "y"
+        teardown(full=(c == "b"), purge=purge)
+        say("Done.", G)
+        if c == "b":
+            sys.exit(0)
+
+
+def status():
+    st = need_state()
+    if not st:
+        return
+    print(sh("systemctl is-active night-tunnel-gost night-tunnel-panel night-tunnel-l3").stdout)
+    list_transports(st)
+    if "wg" in st.get("l3", {}):
+        print("wg handshake:", sh(f"wg show {DEV['wg']} latest-handshakes").stdout.strip() or "-")
+
+
+def bbr():
+    need_root()
+    conf = open("/etc/sysctl.conf").read()
+    if "tcp_congestion_control=bbr" not in conf:
+        with open("/etc/sysctl.conf", "a") as f:
+            f.write("\nnet.core.default_qdisc=fq\nnet.ipv4.tcp_congestion_control=bbr\n")
+        sh("sysctl -p")
+    say("BBR enabled.", G)
+
+
+def menu():
+    while True:
+        say(f"\n=== night-tunnel v{VERSION} ===", G)
+        print("1) Setup FOREIGN server (exit)\n2) Setup IRAN server (entry)\n3) Transports (edit / add / delete)"
+              "\n4) Forwarded ports (Iran: add / edit / delete)\n5) Sync token\n6) Status\n7) Logs\n8) Restart"
+              "\n9) Panel info / reset panel password\n10) Update (script / engine)\n11) Remove (delete tunnel / uninstall all)"
+              "\n12) Enable BBR\n13) TEST tunnels (connect + speed + recommendation)"
+              "\n14) Update tunnel settings (IPs / SNI / rotate keys)"
+              "\n15) EASY SETUP: build the tunnel + auto-install the other server over SSH"
+              "\n16) Web panel first (then set up everything from the browser)"
+              "\n17) Telegram proxy (separate from the tunnels)"
+              "\n18) Security mode (with / without password)\n0) Exit")
+        c = input("Choose: ").strip()
+        try:
+            if c == "1":
+                setup_foreign()
+            elif c == "2":
+                setup_iran()
+            elif c == "3":
+                transports_menu()
+            elif c == "4":
+                ports_menu()
+            elif c == "5":
+                sync_menu()
+            elif c == "6":
+                status()
+            elif c == "7":
+                print(sh("journalctl -u night-tunnel-gost -n 40 --no-pager").stdout)
+            elif c == "8":
+                sh("systemctl restart night-tunnel-l3 night-tunnel-gost night-tunnel-panel")
+                say("Restarted.", G)
+            elif c == "9":
+                reset_panel()
+            elif c == "10":
+                update_menu()
+            elif c == "11":
+                remove_menu()
+            elif c == "12":
+                bbr()
+            elif c == "13":
+                test_menu()
+            elif c == "14":
+                update_tunnel_menu()
+            elif c == "15":
+                easy_menu()
+            elif c == "16":
+                panel_init()
+            elif c == "17":
+                tg_menu()
+            elif c == "18":
+                security_menu()
+            elif c == "0":
+                return
+        except FileNotFoundError:
+            say("Not configured yet: run setup first.", R)
+
+
+def engine_cmd():
+    err = install_gost()
+    if err:
+        print(err, file=sys.stderr)
+        sys.exit(1)
+
+
+def main():
+    a = sys.argv[1] if len(sys.argv) > 1 else "menu"
+    if a == "reset-yes":
+        return teardown()
+    if a == "uninstall-yes":
+        return teardown(full=True, purge="--purge" in sys.argv)
+    {"menu": menu, "panel": run_panel, "l3-up": l3_up, "l3-down": l3_down,
+     "status": status, "apply": apply, "test": test_menu, "setup-foreign": setup_foreign,
+     "setup-iran": setup_iran, "easy": easy_menu, "panel-init": panel_init, "tg": tg_menu,
+     "install-units": write_units, "install-engine": engine_cmd,
+     "auto-foreign": lambda: auto_cmd("foreign"), "auto-iran": lambda: auto_cmd("iran")}.get(a, menu)()
+
+
+if __name__ == "__main__":
+    main()
