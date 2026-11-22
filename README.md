@@ -5,7 +5,7 @@ Multi-transport, anti-DPI tunnel with a web panel. Two servers: **foreign** (exi
 ## نصب / Install (روی هر دو سرور)
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/YOUR_USER/night-tunnel/main/install.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/Night-net83/night-tunnel/main/install.sh)
 ```
 
 بعد از نصب، هر زمان `night-tunnel` را بزنید.
