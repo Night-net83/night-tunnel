@@ -34,7 +34,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
 NAME = "night-tunnel"
-VERSION = "1.4.0"
+VERSION = "1.5.0"
 BASE = os.environ.get("NT_BASE", "/etc/night-tunnel")
 STATE = BASE + "/state.json"
 GOST_CFG = BASE + "/gost.json"
@@ -1043,7 +1043,7 @@ def detached_panel_restart():
 # Iran server    : for every transport a throw-away gost client is pointed at that bench server through
 #                  the real transport; kernel carriers are tested with ping + a TCP bench over the link.
 BENCH = BASE + "/bench.json"
-BENCH_STATE = {"running": False, "log": []}
+BENCH_STATE = {"running": False, "log": [], "live": [], "done": 0, "total": 0}
 STEALTH = {"wss", "mwss", "tls", "mtls", "grpc", "h2", "ws", "mws", "otls", "ohttp"}
 
 
@@ -1262,11 +1262,31 @@ def bench_recommend(st, res):
     return {"lines": [x for x in lines if x], "order": order}
 
 
+def bench_live(res, full, n_kernel):
+    """Publish progress for the panel: one line per tunnel plus a done/total counter."""
+    lines, pending = [], 0
+    for r in res:
+        if not r.get("ok"):
+            lines.append(f"{r['name']}: failed ({r.get('err') or 'no reply'})")
+        elif "down" in r:
+            lines.append(f"{r['name']}: {r['rtt']} ms, down {r['down']} / up {r['up']} Mb/s")
+        else:
+            if full and r.get("kind") == "relay":
+                pending += 1
+            lines.append(f"{r['name']}: {r['rtt']} ms" + (" ... speed test pending" if full else ""))
+    n_relay = sum(1 for r in res if r.get("kind") == "relay")
+    BENCH_STATE["live"] = lines
+    BENCH_STATE["total"] = n_relay + n_kernel
+    BENCH_STATE["done"] = len(res) - pending
+
+
 def run_bench(st, full=True, secs=4, log=print):
     """Run from the Iran server. Returns (report, error)."""
     if st["role"] != "iran":
         return None, ERR + "Run the tunnel test on the Iran server (the entry side)."
     key, bp = st["auth"]["p"], bench_port(st)
+    nk = len(st.get("l3") or {})
+    BENCH_STATE.update(live=[], done=0, total=0)
     gostbin = shutil.which("gost") or "/usr/local/bin/gost"
     secure = is_secure(st)
     used, local, bad, svcs, chains = {bp, st["panel"]["port"]}, {}, {}, [], []
@@ -1314,6 +1334,7 @@ def run_bench(st, full=True, secs=4, log=print):
             r.update(name=t["id"], kind="relay", enc=enc_of(t),
                      layer="L3 relay" if t["via"] != "direct" else "relay")
             res.append(r)
+        bench_live(res, full, nk)
         # password check: right password connected above; the wrong one must be rejected
         by_tid = {t["id"]: t for t in st["transports"]}
         if secure:
@@ -1337,6 +1358,7 @@ def run_bench(st, full=True, secs=4, log=print):
             if r["ok"] and full:
                 log(f"Speed test: {r['name']} ...")
                 bench_speed("127.0.0.1", local[r["name"]], key, secs, r)
+                bench_live(res, full, nk)
         for name, c in (st.get("l3") or {}).items():
             log(f"Kernel tunnel {name}: ping + TCP ...")
             pg = ping_host(c["f_ip"])
@@ -1352,6 +1374,7 @@ def run_bench(st, full=True, secs=4, log=print):
                             else str(e) or "no reply")
             r["ping_ms"] = pg["rtt"]
             res.append(r)
+            bench_live(res, full, nk)
     finally:
         if proc and proc.poll() is None:
             proc.terminate()
@@ -1395,6 +1418,111 @@ def op_bench_apply(st, rep=None):
     if not msg.startswith(ERR):
         st["strategy"] = "fifo"
     return msg
+
+
+def bench_verdict(r):
+    """Plain-language rating of one test result for people who do not read numbers."""
+    if not r.get("ok"):
+        return "failed"
+    loss, rtt = r.get("loss", 0), r.get("rtt") or 0
+    if loss >= 0.3:
+        return "weak"
+    if "down" in r:
+        sp = ((r.get("down") or 0) + (r.get("up") or 0)) / 2
+        if sp >= 30 and loss <= 0.05 and rtt <= 250:
+            return "excellent"
+        if sp >= 10 and loss <= 0.1:
+            return "good"
+        return "ok" if sp >= 3 else "weak"
+    if loss <= 0.05 and rtt <= 120:
+        return "excellent"
+    if loss <= 0.1 and rtt <= 250:
+        return "good"
+    return "ok" if rtt <= 500 else "weak"
+
+
+def bench_best(rep):
+    """Name of the best working relay tunnel of a test report (highest score), or None."""
+    ok = [r for r in rep.get("results", []) if r.get("ok") and r.get("kind") == "relay"]
+    return max(ok, key=lambda r: r.get("score", 0))["name"] if ok else None
+
+
+def op_use_tunnel(st, name, only=False):
+    """Iran side: make ONE tested tunnel carry the traffic.
+    relay name  -> it becomes first (failover); only=True also switches every other relay tunnel off.
+    kernel:<c>  -> every forwarded port goes through that kernel tunnel.
+    pool        -> kernel-routed ports go back to the relay pool."""
+    if st["role"] != "iran":
+        return ERR + "Choose the tunnel on the Iran server (the entry side)."
+    ports = st.get("ports", [])
+    if name == "pool":
+        back = [p for p in ports if p.get("via")]
+        for p in back:
+            p.pop("via")
+        return f"{len(back)} port(s) sent back to the relay pool." if back else "No port used a kernel tunnel."
+    if name.startswith("kernel:"):
+        c = name[7:]
+        if c not in (st.get("l3") or {}):
+            return ERR + "Unknown kernel tunnel."
+        if not ports:
+            return ERR + "Add a forwarded port first (Ports tab)."
+        for p in ports:
+            p["via"] = c
+        return (f"All {len(ports)} forwarded port(s) now go through the {CARRIERS[c][0]} kernel tunnel "
+                "(fast, but no obfuscation and no failover).")
+    if not find_tp(st, name):
+        return ERR + "Unknown tunnel."
+    others = [t["id"] for t in st["transports"] if t["enabled"] and t["id"] != name]
+    msg = op_set_ids(st, [name] if only else [name] + others)
+    if msg.startswith(ERR):
+        return msg
+    st["strategy"] = "fifo"
+    back = [p for p in ports if p.get("via")]
+    for p in back:
+        p.pop("via")
+    out = f"Now using {name}" + (" only." if only else " as the main tunnel; the others stay as backup.")
+    if back:
+        out += f" {len(back)} kernel-routed port(s) moved back to the relay pool."
+    return out
+
+
+def op_use_best(st, only=False):
+    try:
+        with open(BENCH) as f:
+            rep = json.load(f)
+    except (OSError, ValueError):
+        return ERR + "Run the tunnel test first."
+    name = bench_best(rep)
+    if not name:
+        return ERR + "No working tunnel in the last test."
+    return op_use_tunnel(st, name, only)
+
+
+def op_all_models(st):
+    """Foreign side: build + enable every tunnel model so the Iran test can compare ALL of them."""
+    e = only_foreign(st)
+    if e:
+        return e
+    added, failed = [], []
+    for k in CATALOG:
+        if not find_tp(st, k):
+            (failed if op_tp_add(st, k).startswith(ERR) else added).append(k)
+    for c in CARRIERS:
+        if c not in (st.get("l3") or {}) and not find_tp(st, c):
+            try:
+                m = op_carrier_add(st, c)
+            except Exception as ex:  # a kernel without that module must not stop the rest
+                m = ERR + str(ex)
+            (failed if m.startswith(ERR) else added).append(c)
+    for t in st["transports"]:
+        t["enabled"] = True
+    if not added and failed:
+        return ERR + "Could not build: " + ", ".join(failed)
+    if not added:
+        return "Every tunnel model is already built."
+    tail = f" Could not build: {', '.join(failed)}." if failed else ""
+    return (f"Built {len(added)} more model(s): {', '.join(added)}.{tail} Copy the new token to the Iran server "
+            "(Sync token), then run the test there. Afterwards switch off the models you do not use.")
 
 
 def bench_bg(st, full):
@@ -1615,6 +1743,12 @@ font:12px/1.55 ui-monospace,Menlo,Consolas,monospace;direction:ltr;text-align:le
 .login form{display:grid;gap:12px;margin-top:20px}.login input{width:100%}
 .dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--mu);margin-inline-end:8px}
 ul.rec{margin:8px 0 0;padding-inline-start:20px}ul.rec li{margin:4px 0}
+.bar{height:6px;border-radius:99px;background:rgba(148,163,184,.18);overflow:hidden;min-width:64px;margin-top:5px}
+.bar>i{display:block;height:100%;background:linear-gradient(90deg,var(--ac),var(--ac2));transition:width .5s}
+form.inl{display:inline-block;margin:2px 4px 2px 0}
+details{margin-top:12px}summary{cursor:pointer;color:var(--ac2)}
+.mgrp{margin:10px 0}.mgrp>b{display:block;font-size:12px;color:var(--mu);margin-bottom:2px}
+.mgrp .ck{margin-inline-end:16px}
 @media(max-width:860px){
 .app{grid-template-columns:minmax(0,1fr)}
 .side{position:sticky;top:0;z-index:5;height:auto;flex-direction:row;align-items:center;padding:9px 10px;gap:3px;overflow-x:auto;
@@ -1708,7 +1842,9 @@ function poll(){
   var u=$('[data-upcount]');if(u){var n=0;for(var k in d.tp)if(d.tp[k]==='up')n++;u.textContent=n}
   var w=$('#wg');if(w&&d.wg)w.textContent=d.wg;
   var bl=$('#benchlog');if(bl)bl.textContent=d.bench.log||'';
-  var wl=$('#wizlog');if(wl&&d.wiz.log)wl.textContent=d.wiz.log;
+  $$('.wizlog').forEach(function(e){if(d.wiz.log)e.textContent=d.wiz.log});
+  var bv=$('#benchlive');if(bv)bv.textContent=d.bench.live||'';
+  var bb=$('#benchbar');if(bb)bb.style.width=(d.bench.pct||0)+'%';
   if(run&&!d.bench.running&&!d.wiz.running)location.reload();
  }).catch(function(){});
 }
@@ -1816,6 +1952,42 @@ FA_TEXT = {
     "Give the other server's IP and root SSH login. This server installs night-tunnel there, creates both sides of the tunnel and runs a first test. The SSH password is used once and not stored.": "آی‌پی سرور مقابل و لاگین root آن را بدهید. این سرور night-tunnel را آنجا نصب می‌کند، هر دو سمت تانل را می‌سازد و یک تست اولیه می‌زند. پسورد SSH یک‌بار استفاده می‌شود و ذخیره نمی‌شود.",
 }
 
+FA_TEXT.update({
+    "Excellent": "عالی", "Good": "خوب", "OK": "قابل‌قبول", "Weak": "ضعیف", "Failed": "ناموفق",
+    "Main": "اصلی", "Backup": "پشتیبان", "In use": "در حال استفاده", "Verdict": "ارزیابی", "Choose": "انتخاب",
+    "Use as main": "انتخاب به‌عنوان اصلی", "Use only this": "فقط همین",
+    "Send my ports through it": "پورت‌های من از این رد شوند", "not encrypted": "رمزگذاری‌نشده",
+    "Switch off every other tunnel and use only this one? (no backup if it fails)": "بقیه تانل‌ها خاموش شوند و فقط همین استفاده شود؟ (اگر قطع شود پشتیبانی نیست)",
+    "Send all forwarded ports through this kernel tunnel? (no obfuscation, no failover)": "همه پورت‌ها از این تانل کرنلی رد شوند؟ (بدون ابفیوسکیشن و بدون فیل‌اور)",
+    "Best for you": "بهترین گزینه برای شما",
+    "Use it as main (others stay as backup)": "انتخاب به‌عنوان اصلی (بقیه پشتیبان می‌مانند)",
+    "Use only this one": "فقط همین یکی",
+    "The fastest working tunnel of the last test. Check the Encrypted column too: fast does not always mean safe from filtering.": "سریع‌ترین تانل سالم در آخرین تست. ستون «رمزگذاری» را هم ببینید: سریع بودن همیشه به معنی در امان بودن از فیلتر نیست.",
+    "Send kernel-routed ports back to the relay pool": "پورت‌های کرنلی به استخر ریلی برگردند",
+    "Speed tests use real bandwidth for about 10 seconds per tunnel. Only tunnels the foreign server has built are tested: to compare every model use Test, Build every tunnel model on the foreign panel, then Sync token here.": "تست سرعت حدود ۱۰ ثانیه برای هر تانل از پهنای باند واقعی استفاده می‌کند. فقط تانل‌هایی تست می‌شوند که سرور خارج ساخته است: برای مقایسه‌ی همه‌ی مدل‌ها در پنل سرور خارج بخش تست ← «ساخت همه‌ی مدل‌ها» را بزنید، بعد اینجا توکن را Sync کنید.",
+    "Compare every tunnel model": "مقایسه‌ی همه‌ی مدل‌های تانل",
+    "Build every tunnel model for testing": "ساخت همه‌ی مدل‌های تانل برای تست",
+    "Build and enable every tunnel model? You must copy the new token to the Iran server afterwards.": "همه‌ی مدل‌های تانل ساخته و فعال شوند؟ بعدش باید توکن جدید را در سرور ایران وارد کنید.",
+    "Every tunnel model is already built. Run the test on the Iran server.": "همه‌ی مدل‌ها از قبل ساخته شده‌اند. تست را روی سرور ایران اجرا کنید.",
+    "1) Build all models here. 2) Copy the new token to the Iran server (Token tab, Sync). 3) Run the test in the Iran panel and pick the winner. 4) Switch off the models you do not use afterwards.": "۱) همه‌ی مدل‌ها را اینجا بسازید. ۲) توکن جدید را در سرور ایران Sync کنید. ۳) در پنل ایران تست بگیرید و برنده را انتخاب کنید. ۴) بعدش مدل‌های بلااستفاده را خاموش کنید.",
+    "Open Token tab": "باز کردن توکن", "Setup finished": "نصب تمام شد",
+    "Manual setup": "نصب دستی", "Manual setup: foreign (exit) server": "نصب دستی: سرور خارج (خروجی)",
+    "Manual setup: Iran (entry) server": "نصب دستی: سرور ایران (ورودی)",
+    "Same as menu 1 in the terminal. Build this side first, then copy its token to the Iran server. No SSH access needed.": "معادل منوی ۱ ترمینال. اول این سمت را بسازید، بعد توکنش را در سرور ایران وارد کنید. به SSH نیازی نیست.",
+    "Same as menu 2 in the terminal. Paste the token from the foreign server.": "معادل منوی ۲ ترمینال. توکن سرور خارج را پیست کنید.",
+    "Iran server IP": "آی‌پی سرور ایران", "Domain pointing to this server (optional, real SSL)": "دامنه‌ی متصل به این سرور (اختیاری، SSL واقعی)",
+    "Domain pointing to this server (optional)": "دامنه‌ی متصل به این سرور (اختیاری)",
+    "Decoy SNI (used when there is no domain)": "SNI پوششی (وقتی دامنه ندارید)", "Security": "امنیت",
+    "Tunnels to build": "تانل‌هایی که ساخته شوند",
+    "Recommended set (balanced + WireGuard backup)": "مجموعه‌ی پیشنهادی (متعادل + پشتیبان WireGuard)",
+    "Every model (best for comparing speeds)": "همه‌ی مدل‌ها (مناسب مقایسه‌ی سرعت)",
+    "Only the ones I tick below": "فقط مواردی که پایین تیک می‌زنم",
+    "This server's public IP (only if it cannot be detected)": "آی‌پی عمومی این سرور (فقط اگر خودکار پیدا نشد)",
+    "Pick tunnels": "انتخاب تانل‌ها", "Create foreign (exit) side": "ساخت سمت خارج (خروجی)",
+    "Token from the foreign server": "توکن سرور خارج", "Ports to forward on this server": "پورت‌های فوروارد روی این سرور",
+    "Create Iran (entry) side": "ساخت سمت ایران (ورودی)",
+})
+
 JS = JS_TPL.replace("__FA__", json.dumps(FA_TEXT, ensure_ascii=False))
 
 
@@ -1870,7 +2042,10 @@ def status_json(st):
     pr = probe_all(st) if st["role"] != "new" else {}
     last = lambda lg: (lg[-1] if lg else "").lstrip(ERR)
     return json.dumps({"svc": svc_states(), "tp": pr, "wg": wg_age(st),
-                       "bench": {"running": BENCH_STATE["running"], "log": last(BENCH_STATE["log"])},
+                       "bench": {"running": BENCH_STATE["running"], "log": last(BENCH_STATE["log"]),
+                         "live": "\n".join(BENCH_STATE.get("live", [])),
+                         "pct": int(100 * BENCH_STATE.get("done", 0) / BENCH_STATE["total"])
+                         if BENCH_STATE.get("total") else 0},
                        "wiz": {"running": WIZ["running"], "log": "\n".join(WIZ["log"])}})
 
 
@@ -2074,14 +2249,52 @@ def render_token(st):
                 "Paste the token from the foreign server's panel after you change anything there.")
 
 
+BV_LABEL = {"excellent": "Excellent", "good": "Good", "ok": "OK", "weak": "Weak", "failed": "Failed"}
+BV_CLS = {"excellent": "up", "good": "up", "ok": "udp", "weak": "down", "failed": "down"}
+
+
+def bpill(v):
+    return f"<span class='pill {BV_CLS[v]}'>{BV_LABEL[v]}</span>"
+
+
+def use_forms(name, kernel=False):
+    if kernel:
+        return form({"a": "usetunnel", "name": name, "only": "0"}, "<button class='btn g s'>Send my ports through it</button>",
+                    confirm="Send all forwarded ports through this kernel tunnel? (no obfuscation, no failover)", cls="inl")
+    return (form({"a": "usetunnel", "name": name, "only": "0"}, "<button class='btn s'>Use as main</button>", cls="inl")
+            + form({"a": "usetunnel", "name": name, "only": "1"}, "<button class='btn g s'>Use only this</button>",
+                   confirm="Switch off every other tunnel and use only this one? (no backup if it fails)", cls="inl"))
+
+
+def render_bench_foreign(st):
+    have = {t["id"] for t in st["transports"]} | set(st.get("l3") or {})
+    missing = [k for k in list(CATALOG) + list(CARRIERS) if k not in have]
+    top = card("Test tunnels", "", "Run the test from the Iran server's panel (the entry side). "
+                                   "This server answers the test automatically.")
+    if missing:
+        body = (f"<p>{len(st['transports'])} tunnel(s) are built. Not built yet: <span class=mono>{esc(', '.join(missing))}</span></p>"
+                + form({"a": "allmodels"}, "<button class=btn>Build every tunnel model for testing</button>",
+                       confirm="Build and enable every tunnel model? You must copy the new token to the Iran server afterwards."))
+    else:
+        body = "<p>Every tunnel model is already built. Run the test on the Iran server.</p>"
+    return top + card("Compare every tunnel model", body,
+                      "1) Build all models here. 2) Copy the new token to the Iran server (Token tab, Sync). "
+                      "3) Run the test in the Iran panel and pick the winner. 4) Switch off the models you do not use afterwards.")
+
+
 def render_bench(st):
     if st["role"] != "iran":
-        return card("Test tunnels", "", "Run the test from the Iran server's panel (the entry side). "
-                                         "This server answers the test automatically.")
+        return render_bench_foreign(st)
+    hint = ("Speed tests use real bandwidth for about 10 seconds per tunnel. Only tunnels the foreign server has built are "
+            "tested: to compare every model use Test, Build every tunnel model on the foreign panel, then Sync token here.")
     body = ""
     if BENCH_STATE["running"]:
         last = (BENCH_STATE["log"][-1] if BENCH_STATE["log"] else "starting").lstrip(ERR)
-        body += f"<div class=flash><span class=dot></span><span id=benchlog>{esc(last)}</span></div>"
+        tot = BENCH_STATE.get("total") or 0
+        pct = int(100 * BENCH_STATE.get("done", 0) / tot) if tot else 0
+        body += (f"<div class=flash><span class=dot></span><span id=benchlog>{esc(last)}</span></div>"
+                 f"<div class=bar><i id=benchbar style='width:{pct}%'></i></div>"
+                 f"<pre class=log id=benchlive>{esc(chr(10).join(BENCH_STATE.get('live', [])))}</pre>")
     else:
         err = next((x for x in reversed(BENCH_STATE["log"]) if x.startswith(ERR)), "")
         if err:
@@ -2092,29 +2305,59 @@ def render_bench(st):
         with open(BENCH) as f:
             rep = json.load(f)
     except (OSError, ValueError):
-        return card("Test tunnels", body, "Speed tests use real bandwidth for about 10 seconds per tunnel.")
+        return card("Test tunnels", body, hint)
+    active = [t["id"] for t in st["transports"] if t["enabled"]]
+    kports = {p["via"] for p in st.get("ports", []) if p.get("via")}
+    fifo = st.get("strategy", "fifo") == "fifo"
+    ok = [r for r in rep["results"] if r["ok"]]
+    topscore = max((r.get("score", 0) for r in ok), default=0) or 1
     rows = ""
     for r in sorted(rep["results"], key=lambda r: -r.get("score", 0)):
+        nm, kern = r["name"], r.get("kind") == "kernel"
+        mark = ""
+        if kern and nm.replace("kernel:", "") in kports:
+            mark = " <span class='pill up'>In use</span>"
+        elif not kern and nm in active:
+            mark = (" <span class='pill up'>Main</span>" if nm == active[0] else " <span class='pill plain'>Backup</span>") if fifo \
+                else " <span class='pill up'>In use</span>"
         if r["ok"]:
             openp = r.get("auth") == "OPEN"
-            rows += (f"<tr><td><b>{esc(r['name'])}</b></td><td class=mu>{esc(r['layer'])}</td><td>{pill('up')}</td>"
+            pct = int(100 * r.get("score", 0) / topscore)
+            rows += (f"<tr><td><b>{esc(nm)}</b>{mark}</td><td class=mu>{esc(r['layer'])}</td><td>{bpill(bench_verdict(r))}</td>"
                      f"<td>{r['rtt']}</td><td>{r['jitter']}</td><td>{int(r['loss'] * 100)}%</td>"
                      f"<td>{r.get('down', '-')}</td><td>{r.get('up', '-')}</td><td>{esc(r.get('enc', '-'))}</td>"
                      f"<td><span class='pill {'down' if openp else 'up'}'>{esc(r.get('auth', '-'))}</span></td>"
-                     f"<td><b>{r.get('score', '-')}</b></td></tr>")
+                     f"<td><b>{r.get('score', '-')}</b><div class=bar><i style='width:{pct}%'></i></div></td>"
+                     f"<td>{use_forms(nm, kern)}</td></tr>")
         else:
-            rows += (f"<tr><td><b>{esc(r['name'])}</b></td><td class=mu>{esc(r['layer'])}</td><td>{pill('down')}</td>"
-                     f"<td colspan=8 class=mu>{esc(r.get('err', ''))}</td></tr>")
+            rows += (f"<tr><td><b>{esc(nm)}</b></td><td class=mu>{esc(r['layer'])}</td><td>{bpill('failed')}</td>"
+                     f"<td colspan=8 class=mu>{esc(r.get('err', ''))}</td><td></td></tr>")
     when = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(rep["ts"]))
     body += (f"<p class=hint><span>Last run</span>: {when}</p><div class=scroll><table class=tbl><tr><th>Tunnel</th><th>Layer</th>"
-             "<th>State</th><th>RTT ms</th><th>Jitter</th><th>Loss</th><th>Down Mb/s</th><th>Up Mb/s</th>"
-             f"<th>Encrypted</th><th>Password</th><th>Score</th></tr>{rows}</table></div>")
-    out = card("Test tunnels", body)
+             "<th>Verdict</th><th>RTT ms</th><th>Jitter</th><th>Loss</th><th>Down Mb/s</th><th>Up Mb/s</th>"
+             f"<th>Encrypted</th><th>Password</th><th>Score</th><th>Choose</th></tr>{rows}</table></div>")
+    hero = ""
+    best = None if BENCH_STATE["running"] else bench_best(rep)
+    if best:
+        b = next(r for r in rep["results"] if r["name"] == best)
+        sp = f"down {b['down']} / up {b['up']} Mb/s, " if "down" in b else ""
+        warn = " <span class='pill udp'>not encrypted</span>" if b.get("enc") == "no" else ""
+        hero = card("Best for you",
+                    f"<p><b class=mono>{esc(best)}</b> {bpill(bench_verdict(b))}{warn} "
+                    f"<span class=mu>{sp}latency {b['rtt']} ms, loss {int(b['loss'] * 100)}%</span></p><div class=row>"
+                    + form({"a": "usebest", "only": "0"}, "<button class=btn>Use it as main (others stay as backup)</button>")
+                    + form({"a": "usebest", "only": "1"}, "<button class='btn g'>Use only this one</button>",
+                           confirm="Switch off every other tunnel and use only this one? (no backup if it fails)") + "</div>",
+                    "The fastest working tunnel of the last test. Check the Encrypted column too: fast does not always mean safe from filtering.",
+                    cls="ok")
+    out = card("Test tunnels", body, hint)
     rec = "<ul class=rec>" + "".join(f"<li>{esc(x)}</li>" for x in rep["rec"]["lines"]) + "</ul>"
     if rep["rec"]["order"] and not BENCH_STATE["running"]:
         rec += form({"a": "benchapply"}, "<p><button class=btn>Apply suggested order</button></p>",
                     confirm="Enable only the working tunnels in the suggested order?")
-    return out + card("Recommendation", rec)
+    if kports:
+        rec += form({"a": "usetunnel", "name": "pool"}, "<p><button class='btn g'>Send kernel-routed ports back to the relay pool</button></p>")
+    return hero + out + card("Recommendation", rec)
 
 
 def render_security(st):
@@ -2228,7 +2471,10 @@ def render_system(st):
 def render_wiz_result():
     r = WIZ.get("result")
     if not r:
-        return ""
+        if not WIZ.get("notice"):
+            return ""
+        return card("Setup finished", f"<p>{esc(WIZ['notice'])}</p>"
+                    + form({"a": "wizclear"}, "<p><button class='btn g'>Dismiss</button></p>"), cls="ok")
     o = r["other_panel"]
     h = (f"<p>Forwarded ports: <b class=mono>{esc(', '.join(map(str, r['ports'])))}</b> (Iran &rarr; foreign 127.0.0.1:port)</p>"
          "<dl class=kv><dt>Other server's panel</dt>"
@@ -2240,13 +2486,125 @@ def render_wiz_result():
     return card("Easy setup finished", h + form({"a": "wizclear"}, "<p><button class='btn g'>Dismiss</button></p>"), cls="ok")
 
 
+def wiz_running():
+    return card("Setting up...", "<pre class='log wizlog'>" + esc("\n".join(WIZ["log"])) + "</pre>",
+                "This page updates by itself. It can take a few minutes.")
+
+
+def render_manual():
+    o = ""
+    if WIZ["error"] and not WIZ["running"]:
+        o += f"<div class='flash e'>{esc(WIZ['error'])}</div>"
+    if WIZ["running"]:
+        return o + wiz_running()
+    sel = "".join(
+        f"<div class=mgrp><b>{esc(layer)}</b>" + "".join(
+            f"<label class=ck><input type=checkbox name='sel_{k}'{' checked' if (k in CATALOG and CATALOG[k][3]) or k == 'wg' else ''}> "
+            f"<span class=mono>{k}</span> <span class=mu>{esc(CATALOG[k][2] if k in CATALOG else CARRIERS[k][0] + ' (kernel)')}</span></label>"
+            for k in ids) + "</div>" for layer, ids in LAYERS)
+    ff = form({"a": "mforeign"},
+              "<div class=row>" + fld("Iran server IP", "<input name=iran_ip class='ltr w-m' placeholder='203.0.113.10'>")
+              + fld("Domain pointing to this server (optional, real SSL)", "<input name=domain class='ltr w-l'>")
+              + fld("Decoy SNI (used when there is no domain)", "<input name=sni value='www.microsoft.com' class='ltr w-l'>") + "</div>"
+              "<div class=row style='margin-top:12px'>"
+              + fld("Security", "<select name=mode><option value=password>With password (encrypted, recommended)</option>"
+                    "<option value=open>No password (limited to the Iran IP)</option></select>")
+              + fld("Tunnels to build", "<select name=pick><option value=recommended>Recommended set (balanced + WireGuard backup)</option>"
+                    "<option value=all>Every model (best for comparing speeds)</option>"
+                    "<option value=custom>Only the ones I tick below</option></select>")
+              + fld("This server's public IP (only if it cannot be detected)", "<input name=local_ip class='ltr w-m'>") + "</div>"
+              "<details><summary>Pick tunnels</summary>" + sel + "</details>"
+              "<p><button class=btn>Create foreign (exit) side</button></p>")
+    fi = form({"a": "miran"},
+              fld("Token from the foreign server", "<textarea name=token placeholder='NT1:...'></textarea>")
+              + "<div class=row style='margin-top:12px'>"
+              + fld("Ports to forward on this server", "<input name=ports value=443 class='ltr w-m' placeholder='443,2053'>")
+              + fld("Ports that also need UDP (optional)", "<input name=udp class='ltr w-m'>")
+              + fld("Domain pointing to this server (optional)", "<input name=domain class='ltr w-l'>") + "</div>"
+              "<p><button class=btn>Create Iran (entry) side</button></p>")
+    return (o + card("Manual setup: foreign (exit) server", ff,
+                     "Same as menu 1 in the terminal. Build this side first, then copy its token to the Iran server. No SSH access needed.")
+            + card("Manual setup: Iran (entry) server", fi, "Same as menu 2 in the terminal. Paste the token from the foreign server."))
+
+
+def manual_bg(kind, p):
+    WIZ.update(running=True, log=[], result=None, error="", notice="")
+    try:
+        if os.path.exists(STATE):
+            raise RuntimeError("this server already has a tunnel configured")
+        if kind == "foreign":
+            WIZ["log"].append("Detecting this server's IP ...")
+            me = p["local_ip"] or public_ip()
+            if not valid_ip(me):
+                raise RuntimeError("could not detect this server's public IP; enter it")
+            WIZ["log"].append("Creating the foreign (exit) side (certificate, firewall, services) ...")
+            st, _ = core_foreign(me, p["iran_ip"], p["domain"], p["sni"], p["tp_ids"], p["carriers"], p["custom"],
+                                 p["secure"], reuse_panel=True)
+            start_bench(st)
+            WIZ["notice"] = ("The foreign side is ready. Open the Token tab, copy the token and import it on the Iran server.")
+        else:
+            WIZ["log"].append("Creating the Iran (entry) side ...")
+            core_iran(p["d"], p["domain"], p["ports"], reuse_panel=True)
+            WIZ["notice"] = "The Iran side is ready. Open the Test tab to compare the tunnels and pick one."
+    except Exception as e:
+        WIZ["error"] = f"Setup failed: {e}"
+    finally:
+        WIZ["running"] = False
+
+
+def manual_start(a, f):
+    if WIZ["running"]:
+        return ERR + "Setup is already running."
+    if os.path.exists(STATE):
+        return ERR + "This server already has a tunnel configured."
+    domain = f.get("domain", "").strip()
+    if domain and not valid_host(domain):
+        return ERR + "Invalid domain."
+    if a == "mforeign":
+        iran, local = f.get("iran_ip", "").strip(), f.get("local_ip", "").strip()
+        sni = domain or f.get("sni", "").strip() or "www.microsoft.com"
+        if not valid_ip(iran):
+            return ERR + "Enter the Iran server's IPv4 address."
+        if not valid_host(sni):
+            return ERR + "Invalid SNI."
+        if local and not valid_ip(local):
+            return ERR + "Invalid public IP."
+        pick = f.get("pick", "recommended")
+        if pick == "all":
+            tps, car, custom = list(CATALOG), list(CARRIERS), True
+        elif pick == "custom":
+            tps = [k for k in CATALOG if "sel_" + k in f]
+            car = [k for k in CARRIERS if "sel_" + k in f]
+            custom = True
+            if not tps and not car:
+                return ERR + "Tick at least one tunnel."
+        else:
+            tps, car, custom = list(CATALOG), ["wg"], False
+        p = {"iran_ip": iran, "domain": domain, "sni": sni, "local_ip": local, "tp_ids": tps, "carriers": car,
+             "custom": custom, "secure": f.get("mode") != "open"}
+        kind = "foreign"
+    else:
+        try:
+            d = parse_token(f.get("token", ""))
+            assert d["transports"] and d["auth"]
+        except Exception:
+            return ERR + "Invalid token."
+        ports = parse_ports(f.get("ports", ""), f.get("udp", ""))
+        if not ports:
+            return ERR + "Enter at least one valid port to forward."
+        p, kind = {"d": d, "domain": domain, "ports": ports}, "iran"
+    WIZ.update(running=True, log=["starting"], error="", notice="", result=None)
+    threading.Thread(target=manual_bg, args=(kind, p), daemon=True).start()
+    return "Setup started. This page refreshes by itself."
+
+
 def render_setup():
     run = WIZ["running"]
     o = ""
     if WIZ["error"] and not run:
         o += f"<div class='flash e'>{esc(WIZ['error'])}</div>"
     if run:
-        o += card("Setting up...", "<pre class=log id=wizlog>" + esc("\n".join(WIZ["log"])) + "</pre>",
+        o += card("Setting up...", "<pre class='log wizlog'>" + esc("\n".join(WIZ["log"])) + "</pre>",
                   "This page updates by itself. It can take a few minutes.")
     else:
         f = form({"a": "wizard"},
@@ -2261,7 +2619,8 @@ def render_setup():
                  + fld("Security", "<select name=mode><option value=password>With password (encrypted, recommended)</option>"
                        "<option value=open>No password (limited to the Iran IP)</option></select>")
                  + fld("Ports to forward on the Iran server", "<input name=ports value=443 class=w-m placeholder='443,2053'>")
-                 + fld("Ports that also need UDP (optional)", "<input name=udp class=w-m>") + "</div>"
+                 + fld("Ports that also need UDP (optional)", "<input name=udp class=w-m>")
+                 + fld("This server's public IP (only if it cannot be detected)", "<input name=local_ip class='ltr w-m'>") + "</div>"
                  "<p><label class=ck><input type=checkbox name=force> Overwrite an existing night-tunnel config on the other server</label></p>"
                  "<p><button class=btn>Build the tunnel automatically</button></p>")
         o += card("Easy setup", f,
@@ -2273,7 +2632,7 @@ def render_setup():
 # ---- page shell
 def tabs_for(st):
     if st["role"] == "new":
-        return [("setup", "Easy setup", "wand"), ("telegram", "Telegram proxy", "send"),
+        return [("setup", "Easy setup", "wand"), ("manual", "Manual setup", "tunnel"), ("telegram", "Telegram proxy", "send"),
                 ("logs", "Logs", "terminal"), ("system", "System", "settings")]
     t = [("overview", "Overview", "home"), ("transports", "Transports", "layers")]
     t.append(("ports", "Ports", "swap") if st["role"] == "iran" else ("tunnels", "Tunnels", "tunnel"))
@@ -2285,7 +2644,7 @@ def render_page(st, msg=""):
     new = st["role"] == "new"
     states = svc_states()
     pr = {} if new else probe_all(st)
-    secs = {"setup": render_setup, "telegram": lambda: render_tg(st), "logs": render_logs,
+    secs = {"setup": render_setup, "manual": render_manual, "telegram": lambda: render_tg(st), "logs": render_logs,
             "system": lambda: render_system(st)}
     if not new:
         secs.update({"overview": lambda: render_overview(st, states, pr), "transports": lambda: render_transports(st, pr),
@@ -2298,7 +2657,10 @@ def render_page(st, msg=""):
     role = {"iran": "Iran &middot; entry", "foreign": "Foreign &middot; exit", "new": "Not configured"}[st["role"]]
     flash = ""
     if msg:
-        flash = f"<div class='flash{' e' if msg.startswith(ERR) else ''}'>{esc(msg.lstrip(ERR))}</div>"
+        extra = ""
+        if st["role"] == "foreign" and "token" in msg.lower() and not msg.startswith(ERR):
+            extra = " <button type=button class='btn g s' data-tab=token>Open Token tab</button>"
+        flash = f"<div class='flash{' e' if msg.startswith(ERR) else ''}'>{esc(msg.lstrip(ERR))}{extra}</div>"
     run = "1" if (BENCH_STATE["running"] or WIZ["running"]) else "0"
     return (f"<!doctype html><html><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'>"
             f"<title>night-tunnel</title><style>{CSS}</style><body data-run={run}><div class=app>"
@@ -2383,6 +2745,7 @@ def sys_act(st, a, f):
     """Panel actions that work in every state (with or without a tunnel). Returns a message or None."""
     if a == "wizclear":
         WIZ["result"] = None
+        WIZ["notice"] = ""
         return ""
     if a == "chpw":
         return op_panel_pw(st, f.get("pw1", ""), f.get("pw2", ""))
@@ -2517,12 +2880,17 @@ class Handler(BaseHTTPRequestHandler):
                  "ssh_pass": f.get("ssh_pass", ""), "ssh_key": f.get("ssh_key", "").strip(),
                  "secure": f.get("mode") != "open", "force": "force" in f,
                  "ports": parse_ports(f.get("ports", ""), f.get("udp", ""))}
+            if f.get("local_ip", "").strip():
+                p["local_ip"] = f["local_ip"].strip()
             threading.Thread(target=wiz_bg, args=(p,), daemon=True).start()
             WIZ.update(running=True, log=["starting"], error="")
             return "Setup started. This page refreshes by itself."
         if a == "wizclear":
             WIZ["result"] = None
+            WIZ["notice"] = ""
             return ""
+        if a in ("mforeign", "miran"):
+            return manual_start(a, f)
         return sys_act({"role": "new", "panel": load_any()["panel"]}, a, f) or ""
 
     def act(self, st, f):
@@ -2579,6 +2947,12 @@ class Handler(BaseHTTPRequestHandler):
             return "Test started. This page refreshes by itself."
         elif a == "benchapply":
             msg = op_bench_apply(st)
+        elif a == "usetunnel":
+            msg = op_use_tunnel(st, f.get("name", ""), f.get("only") == "1")
+        elif a == "usebest":
+            msg = op_use_best(st, f.get("only") == "1")
+        elif a == "allmodels":
+            msg = op_all_models(st)
         elif a == "caradd":
             msg = op_carrier_add(st, f.get("c"))
         elif a == "security":
@@ -3040,7 +3414,7 @@ def setup_iran():
 # dependencies and the engine, creates the matching side of the tunnel and wires both ends together.
 # The SSH password lives only in memory for the duration of the setup; nothing is written to disk.
 SSH_USER_RE = re.compile(r"^[a-z_][a-z0-9_-]{0,31}$")
-WIZ = {"running": False, "log": [], "result": None, "error": ""}
+WIZ = {"running": False, "log": [], "result": None, "error": "", "notice": ""}
 
 
 class Remote:
@@ -3464,6 +3838,7 @@ def transports_menu():
               "\ne) delete a tunnel (foreign)   f) change port (foreign)"
               "\ng) add kernel carrier directly (foreign)"
               "\nh) EDIT a tunnel: port / transport type / SNI / ws path / host"
+              "\ni) build EVERY model (so the Iran test can compare them all)"
               "\n0) back")
         c = input("Choose: ").strip().lower()
         if c == "0":
@@ -3527,7 +3902,9 @@ def transports_menu():
                     if v != t.get(key, ""):
                         kw[key] = "" if v == "-" else v
             commit(st, op_tp_edit(st, tid, **kw))
-        if c in ("d", "e", "f", "g", "h") and st["role"] == "foreign":
+        elif c == "i":
+            commit(st, op_all_models(st))
+        if c in ("d", "e", "f", "g", "h", "i") and st["role"] == "foreign":
             say("Copy the new token to the Iran server:", Y)
             print(make_token(st))
 
@@ -3587,6 +3964,12 @@ def test_menu():
     say("\nRecommendation", G)
     for ln in rep["rec"]["lines"]:
         print(" - " + ln)
+    names = [r["name"] for r in rep["results"] if r.get("ok")]
+    if names:
+        pick = ask("\nType a tunnel name to use it now, add ' only' to switch the others off (e.g. 'wss only'; Enter = skip)")
+        if pick:
+            nm, _, only = pick.partition(" ")
+            return commit(st, op_use_tunnel(st, nm, only.strip() == "only"))
     if rep["rec"]["order"] and ask("\nApply the suggested order now (enable only the working tunnels)? (y/n)", "n") == "y":
         commit(st, op_bench_apply(st, rep))
 
