@@ -124,3 +124,10 @@ bash <(curl -fsSL https://raw.githubusercontent.com/Night-net83/night-tunnel/mai
 Debian/Ubuntu, root, Python 3.8+, kernel with WireGuard (5.6+); FOU/GENEVE need the `fou`/`ipip`/`geneve` kernel modules.
 
 MIT License
+
+## v1.7.0
+- Pre-build test rewritten (neotunnel-style): the destination opens throw-away listeners for **every** transport (own ports + password), so results no longer depend on what is enabled there. All transports and kernel tunnels are checked **in parallel** (connect + stability), then real speed only for the best 6 (≈ 20 s total). Buttons: *Test all (fast)*, *Quick check (connect only)*, *Full test*.
+- Failed rows now say why: port filtered (timeout), port refused, handshake failed, UDP dropped, or "this gost build cannot start it".
+- One unsupported transport can no longer take the others down: gost is retried per service and the broken one is switched off automatically.
+- Switched-off tunnels show **off** instead of **down**.
+- Creating a tunnel first re-enables the chosen tunnel(s) on the destination.

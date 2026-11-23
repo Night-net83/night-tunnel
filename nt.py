@@ -34,7 +34,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlencode, urlparse
 
 NAME = "night-tunnel"
-VERSION = "1.6.0"
+VERSION = "1.7.0"
 BASE = os.environ.get("NT_BASE", "/etc/night-tunnel")
 STATE = BASE + "/state.json"
 GOST_CFG = BASE + "/gost.json"
@@ -582,6 +582,191 @@ def gen_gost(st):
     return {"log": {"level": "warn"}, "services": svcs, "chains": [chain]}
 
 
+
+# ------------------------------------------------- isolated gost processes (tests + self-heal)
+def _gostbin():
+    return shutil.which("gost") or "/usr/local/bin/gost"
+
+
+def _svc_port(svc):
+    return int(svc["addr"].rsplit(":", 1)[1])
+
+
+def _last_line(path):
+    try:
+        with open(path, errors="replace") as f:
+            ls = [x.strip() for x in f if x.strip()]
+        return ls[-1][-160:] if ls else ""
+    except OSError:
+        return ""
+
+
+def _spawn_cfg(cfg, tag):
+    os.makedirs(BASE, exist_ok=True)
+    path, lg = f"{BASE}/{tag}.json", f"{BASE}/{tag}.log"
+    with open(path, "w") as f:
+        json.dump(cfg, f)
+    os.chmod(path, 0o600)
+    fh = open(lg, "wb")
+    try:
+        return subprocess.Popen([_gostbin(), "-C", path], stdout=fh, stderr=fh), path, lg
+    finally:
+        fh.close()
+
+
+def _wait_bound(procs_ports, wait):
+    end = time.time() + wait
+    while time.time() < end:
+        if all(p.poll() is not None or all(not can_bind(x) for x in ports) for p, ports in procs_ports):
+            break
+        time.sleep(0.05)
+
+
+def spawn_gost(services, chains=None, tls=None, tag="nt-tmp", wait=2.5):
+    """Start gost for a set of services. ONE bad service (type this gost build lacks) normally kills the whole
+    process, so if the combined start fails every missing service is retried alone: returns (procs, bad, files)
+    with bad = {service name: reason}."""
+    def cfg_for(svcs):
+        c = {"log": {"level": "error"}, "services": svcs}
+        used = {s["handler"].get("chain") for s in svcs} - {None}
+        ch = [x for x in (chains or []) if x["name"] in used]
+        if ch:
+            c["chains"] = ch
+        if tls:
+            c["tls"] = tls
+        return c
+    procs, files, bad = [], [], {}
+    p, path, lg = _spawn_cfg(cfg_for(services), tag)
+    procs.append(p)
+    files += [path, lg]
+    _wait_bound([(p, [_svc_port(x) for x in services])], wait)
+    missing = [x for x in services if can_bind(_svc_port(x))]
+    if not missing:
+        return procs, bad, files
+    if p.poll() is None and len(missing) == len(services):
+        p.terminate()
+    solo = []
+    for i, svc in enumerate(missing):
+        q, qp, ql = _spawn_cfg(cfg_for([svc]), f"{tag}-{i}")
+        procs.append(q)
+        files += [qp, ql]
+        solo.append((svc, q, ql))
+    _wait_bound([(q, [_svc_port(svc)]) for svc, q, _ in solo], 1.5)
+    for svc, q, ql in solo:
+        if q.poll() is not None or can_bind(_svc_port(svc)):
+            bad[svc["name"]] = _last_line(ql) or "this gost build cannot start it"
+    return procs, bad, files
+
+
+def stop_gost(procs, files=()):
+    for p in procs:
+        if p.poll() is None:
+            p.terminate()
+    for p in procs:
+        try:
+            p.wait(3)
+        except subprocess.TimeoutExpired:
+            p.kill()
+    for f in files:
+        try:
+            os.remove(f)
+        except OSError:
+            pass
+
+
+def gost_selfheal(st):
+    """If gost died because ONE transport is unsupported/broken, find it, switch only it off and restart.
+    Without this a single bad type makes every tunnel look down."""
+    if not shutil.which("systemctl"):
+        return []
+    time.sleep(1.5)
+    if sh("systemctl is-active night-tunnel-gost").stdout.strip() == "active":
+        return []
+    sh("systemctl stop night-tunnel-gost")
+    on = [t for t in st["transports"] if t["enabled"]]
+    used = {st["panel"]["port"]}
+    bad = []
+
+    def trial(t):
+        if st["role"] == "foreign":
+            cfg = gen_gost(st)
+            svc = next((x for x in cfg["services"] if x["name"] == "in-" + t["id"]), None)
+            if not svc:
+                return None
+            tls, chains = cfg.get("tls"), []
+        else:
+            port = free_port(used)
+            node = dial_node(st, t)
+            chains = [{"name": "c", "hops": [{"name": "h", "nodes": [node]}]}]
+            svc = {"name": "s", "addr": f"127.0.0.1:{port}", "handler": {"type": "tcp", "chain": "c"},
+                   "listener": {"type": "tcp"}, "forwarder": {"nodes": [{"name": "t", "addr": "127.0.0.1:9"}]}}
+            tls = None
+        pr, b, fl = spawn_gost([svc], chains, tls, tag="nt-heal-" + t["id"], wait=1.5)
+        stop_gost(pr, fl)
+        return b.get(svc["name"])
+    for t in on:
+        why = trial(t)
+        if why:
+            t["enabled"], t["broken"] = False, why
+            bad.append(t["id"])
+    if bad and any(t["enabled"] for t in st["transports"]):
+        save(st)
+        cfg = gen_gost(st)
+        with open(GOST_CFG, "w") as f:
+            json.dump(cfg, f, indent=1)
+        sh("systemctl restart night-tunnel-gost")
+    elif not bad:
+        sh("systemctl restart night-tunnel-gost")
+    return bad
+
+
+# ------------------------------------------------- temporary test listeners (destination side)
+TEST = {"procs": [], "files": [], "fw": [], "lock": threading.Lock()}
+TEST_FW = BASE + "/testfw.json"
+
+
+def test_end():
+    with TEST["lock"]:
+        stop_gost(TEST["procs"], TEST["files"])
+        keys = list(TEST["fw"])
+        try:
+            with open(TEST_FW) as f:
+                keys += json.load(f)
+        except (OSError, ValueError):
+            pass
+        for k in set(keys):
+            _fw_apply(k, False)
+        if os.path.exists(TEST_FW):
+            os.remove(TEST_FW)
+        TEST.update(procs=[], files=[], fw=[])
+
+
+def test_listen(st, ttl=150):
+    """Destination side: open a throw-away listener for EVERY transport type (own random ports and password),
+    independent of what is enabled in the real config. Closed again by test_end() / after ttl seconds."""
+    test_end()
+    creds = {"u": "t" + rnd(6), "p": rnd(20)}
+    used = ports_taken(st) | {bench_port(st)}
+    ports = {k: free_port(used) for k in CATALOG}
+    svcs = [{"name": "in-" + k, "addr": f":{ports[k]}",
+             "handler": {"type": "relay", "auth": {"username": creds["u"], "password": creds["p"]}},
+             "listener": {"type": CATALOG[k][0]}} for k in CATALOG]
+    keys = [f"{ports[k]}/{'udp' if CATALOG[k][1] else 'tcp'}" for k in CATALOG]
+    os.makedirs(BASE, exist_ok=True)
+    with open(TEST_FW, "w") as f:
+        json.dump(keys, f)
+    for k in keys:
+        _fw_apply(k, True)
+    with TEST["lock"]:
+        procs, bad, files = spawn_gost(svcs, None, {"certFile": CERT, "keyFile": KEY}, tag="nt-testlisten")
+        TEST.update(procs=procs, files=files, fw=keys)
+    tm = threading.Timer(ttl, test_end)
+    tm.daemon = True
+    tm.start()
+    return {"ok": True, "ports": ports, "user": creds["u"], "pw": creds["p"],
+            "bad": {k[3:]: v for k, v in bad.items()}}
+
+
 def apply(st=None):
     st = st or load()
     kernel_fw(st)
@@ -594,6 +779,8 @@ def apply(st=None):
         json.dump(cfg, f, indent=1)
     os.chmod(GOST_CFG, 0o600)
     sh("systemctl restart night-tunnel-gost")
+    if gost_selfheal(st):
+        return True
     return True
 
 
@@ -658,6 +845,8 @@ def panel_url(st):
 
 # ------------------------------------------------------------------ probes
 def probe(st, t):
+    if not t.get("enabled", True):
+        return "off"
     udp = CATALOG.get(ttype(t), ("", False))[1] if t["via"] == "direct" else False
     if udp:
         return "udp"
@@ -1719,6 +1908,7 @@ border:1px solid var(--line2);color:var(--mu);white-space:nowrap}
 .pill::before{content:"";width:7px;height:7px;border-radius:50%;background:currentColor}
 .pill.up,.pill.active{color:var(--ok);background:rgba(52,211,153,.1);border-color:rgba(52,211,153,.32)}
 .pill.down,.pill.failed,.pill.inactive{color:var(--bad);background:rgba(248,113,113,.1);border-color:rgba(248,113,113,.35)}
+.pill.off{color:var(--mu,#8b93a7);background:rgba(139,147,167,.1);border-color:rgba(139,147,167,.3)}
 .pill.udp,.pill.activating,.pill.warn{color:var(--warn);background:rgba(251,191,36,.1);border-color:rgba(251,191,36,.35)}
 .pill.plain::before{display:none}
 .sw{position:relative;width:40px;height:23px;display:inline-block;vertical-align:middle}
@@ -2647,7 +2837,129 @@ def srv_activate(sid):
     return st
 
 
-def srv_test_bg(sid, full):
+def tcp_class(host, port, timeout=1.5):
+    """Why a TCP port does not answer: closed / filtered / open."""
+    try:
+        socket.create_connection((host, port), timeout=timeout).close()
+        return "open"
+    except ConnectionRefusedError:
+        return "closed"
+    except OSError:
+        return "filtered"
+
+
+def run_probe(st, s, level="fast", log=print):
+    """Pre-build test (Iran side). The destination opens a throw-away listener for EVERY transport type, so the
+    result never depends on what is enabled there. Phase 1 (all in parallel, a few seconds): connect + stability.
+    Phase 2: real speed for the best few. level: quick = phase 1 only, fast = speed top 6 (2 s), full = all (4 s)."""
+    log("Opening test ports on the destination ...")
+    try:
+        info = agent_call(s, "testlisten")
+    except Exception as e:
+        return None, ERR + f"Destination did not answer ({e}). Is it online and joined?"
+    key, bp = st["auth"]["p"], bench_port(st)
+    st2 = dict(st, auth={"u": info["user"], "p": info["pw"]}, secure=True)
+    tl = {k: {"id": k, "type": k, "port": info["ports"][k], "via": "direct", "enabled": True}
+          for k in CATALOG if k in info["ports"]}
+    used, local, svcs, chains = {bp, st["panel"]["port"]}, {}, [], []
+    for k, t in tl.items():
+        local[k] = free_port(used)
+        chains.append({"name": "c-" + k, "hops": [{"name": "h", "nodes": [dial_node(st2, t)]}]})
+        svcs.append({"name": "s-" + k, "addr": f"127.0.0.1:{local[k]}", "handler": {"type": "tcp", "chain": "c-" + k},
+                     "listener": {"type": "tcp"}, "forwarder": {"nodes": [{"name": "t", "addr": f"127.0.0.1:{bp}"}]}})
+    procs, files, res = [], [], []
+    BENCH_STATE.update(live=[], done=0, total=len(tl) + len(st.get("l3") or {}))
+    nk = len(st.get("l3") or {})
+    try:
+        procs, bad, files = spawn_gost(svcs, chains, None, tag="nt-probe")
+        log(f"Testing {len(tl)} transports + {nk} kernel tunnels in parallel ...")
+        cnt = 10 if level == "quick" else 8
+
+        def one(k):
+            t = tl[k]
+            r = {"name": k, "kind": "relay", "enc": enc_of(t), "auth": "password",
+                 "layer": next((re.sub(r"\s+", " ", n) for n, ids in LAYERS if k in ids), "relay"), "ok": False}
+            if info.get("bad", {}).get(k):
+                r["err"] = "destination cannot run it: " + info["bad"][k]
+                return r
+            if bad.get("s-" + k):
+                r["err"] = "this gost build cannot start it: " + bad["s-" + k]
+                return r
+            udp = CATALOG[k][1]
+            if not udp:
+                c = tcp_class(st["foreign_ip"], t["port"])
+                if c != "open":
+                    r["err"] = ("blocked: the port does not answer (firewall / ISP filtering on the path)"
+                                if c == "filtered" else "port refused (nothing listening on the destination)")
+                    return r
+            try:
+                r.update(bench_latency("127.0.0.1", local[k], key, count=cnt, timeout=5))
+            except (OSError, ValueError) as e:
+                r["err"] = ("UDP is dropped or filtered on this path" if udp
+                            else "port open but the tunnel handshake failed") + (f" ({e})" if str(e) else "")
+            return r
+
+        def kern(name):
+            c = st["l3"][name]
+            r = {"name": "kernel:" + name, "kind": "kernel", "layer": "L3 kernel", "ok": False,
+                 "enc": "yes" if name == "wg" else "no", "auth": "key" if name == "wg" else "none"}
+            pg = ping_host(c["f_ip"], 4)
+            try:
+                r.update(bench_latency(c["f_ip"], bp, key, count=cnt, timeout=4))
+                r["loss"] = max(r["loss"], round(pg["loss"], 2))
+            except OSError as e:
+                r["err"] = ("ping ok but TCP failed (update the destination)" if pg["loss"] < 1 else "no reply") \
+                    + (f" ({e})" if str(e) else "")
+            r["ping_ms"] = pg["rtt"]
+            return r
+        with concurrent.futures.ThreadPoolExecutor(max_workers=24) as ex:
+            futs = [ex.submit(one, k) for k in tl] + [ex.submit(kern, n) for n in (st.get("l3") or {})]
+            for f in futs:
+                res.append(f.result())
+        BENCH_STATE["done"] = len(res)
+        bench_live(res, level != "quick", nk)
+        okr = sorted([r for r in res if r["ok"]], key=lambda r: (-bench_stab(r), r.get("rtt") or 9e9))
+        log(f"{len(okr)} of {len(res)} connected.")
+        if level != "quick" and okr:
+            pick = okr if level == "full" else okr[:6]
+            secs = 4 if level == "full" else 2
+            BENCH_STATE["total"] = len(res) + len(pick)
+            for r in pick:
+                log(f"Speed test: {r['name']} ...")
+                if r["kind"] == "kernel":
+                    bench_speed(st["l3"][r["name"][7:]]["f_ip"], bp, key, secs, r)
+                else:
+                    bench_speed("127.0.0.1", local[r["name"]], key, secs, r)
+                BENCH_STATE["done"] += 1
+                bench_live(res, True, nk)
+    finally:
+        stop_gost(procs, files)
+        try:
+            agent_call(s, "testend")
+        except Exception:
+            pass
+    for r in res:
+        r["score"] = bench_score(r)
+    rep = {"ts": int(time.time()), "full": level != "quick", "results": res,
+           "rec": bench_recommend(dict(st, transports=list(tl.values()), secure=True), res)}
+    with open(BENCH, "w") as f:
+        json.dump(rep, f)
+    return rep, None
+
+
+def probe_bg(st, s, level):
+    BENCH_STATE.update(running=True, log=[])
+    try:
+        _, err = run_probe(st, s, level, log=lambda m: BENCH_STATE["log"].append(m))
+        if err:
+            BENCH_STATE["log"].append(err)
+    except Exception as e:
+        BENCH_STATE["log"].append(ERR + f"Test failed: {e}")
+    finally:
+        BENCH_STATE["running"] = False
+
+
+def srv_test_bg(sid, level):
     WIZ.update(running=True, log=["Preparing the connection to the server ..."], result=None, error="", notice="")
     try:
         st = srv_activate(sid)
@@ -2657,7 +2969,11 @@ def srv_test_bg(sid, full):
         BENCH_STATE["running"] = False
         return
     WIZ["running"] = False
-    bench_bg(dict(st), full)
+    sv = srv_find(srv_load(), sid) or {}
+    if sv.get("agent"):
+        probe_bg(dict(st), sv, level)
+    else:
+        bench_bg(dict(st), level != "quick")
     try:
         with open(BENCH) as f:
             ts = json.load(f)["ts"]
@@ -2692,6 +3008,16 @@ def srv_create(f):
         name = bench_best(rep) or ""
     if name not in okr and not any(r["name"] == name and r.get("ok") for r in rep["results"]):
         return ERR + "Choose a tunnel that passed the test."
+    if not name.startswith("kernel:") and s.get("agent"):
+        ids = [name] + ([x for x in okr if x != name] if "backup" in f else [])
+        try:   # the destination may have switched this model off earlier: enable it there first
+            back = agent_call(s, "keep", ",".join(ids))
+            m = op_import_token(st, back["token"])
+            if m.startswith(ERR):
+                return m
+            st = load()
+        except Exception as e:
+            return ERR + f"Destination could not enable {name}: {e}"
     want = {p["port"] for p in ports}
     for p in list(st.get("ports", [])):
         if p["port"] not in want:
@@ -2762,7 +3088,7 @@ def srv_act(f):
         s["test_start"] = int(time.time())
         srv_save(d)
         BENCH_STATE.update(running=True, log=["starting"])
-        threading.Thread(target=srv_test_bg, args=(s["id"], f.get("full") != "0"), daemon=True).start()
+        threading.Thread(target=srv_test_bg, args=(s["id"], {"0": "quick", "2": "full"}.get(f.get("full"), "fast")), daemon=True).start()
         return "Test started. This page refreshes by itself."
     if a == "srvcreate":
         return srv_create(f)
@@ -2830,8 +3156,9 @@ def render_server_card(st, d, s, rep):
                  + (f" password <span class=mono>{esc(pan['pw'])}</span>" if pan.get("pw") else "") + "</p>")
     if not busy:
         body += ("<div class=row>"
-                 + form({"a": "srvtest", "id": sid, "full": "1", "tab": "servers"}, "<button class=btn>Test speed &amp; stability</button>", cls="inl")
-                 + form({"a": "srvtest", "id": sid, "full": "0", "tab": "servers"}, "<button class='btn g'>Quick test</button>", cls="inl")
+                 + form({"a": "srvtest", "id": sid, "full": "1", "tab": "servers"}, "<button class=btn>Test all tunnels (fast)</button>", cls="inl")
+                 + form({"a": "srvtest", "id": sid, "full": "0", "tab": "servers"}, "<button class='btn g'>Quick check (connect only)</button>", cls="inl")
+                 + form({"a": "srvtest", "id": sid, "full": "2", "tab": "servers"}, "<button class='btn g'>Full test (speed on all)</button>", cls="inl")
                  + rm + "</div>")
     else:
         body += "<p class=mu>A test is running. Watch it in the Test tab.</p>"
@@ -3923,6 +4250,11 @@ def agent_serve(st, f, ip):
         out = {"ok": True, "v": VERSION}
     elif cmd == "token":
         out = {"ok": True, "token": make_token(st)}
+    elif cmd == "testlisten":
+        out = test_listen(st)
+    elif cmd == "testend":
+        test_end()
+        out = {"ok": True}
     elif cmd == "all":
         msg = op_all_models(st)
         save(st)
@@ -4019,6 +4351,7 @@ def servers_menu():
 def start_bench(st):
     """The foreign panel process answers the tunnel tester; start it once (also right after a panel-driven setup)."""
     if st["role"] == "foreign" and not _BENCH_THREAD:
+        test_end()  # remove test listeners/firewall rules left by a crash
         t = threading.Thread(target=bench_serve, args=(st,), daemon=True)
         t.start()
         _BENCH_THREAD.append(t)
