@@ -34,7 +34,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlencode, urlparse
 
 NAME = "night-tunnel"
-VERSION = "1.7.0"
+VERSION = "1.8.0"
 BASE = os.environ.get("NT_BASE", "/etc/night-tunnel")
 STATE = BASE + "/state.json"
 GOST_CFG = BASE + "/gost.json"
@@ -2151,6 +2151,21 @@ FA_TEXT = {
 }
 
 FA_TEXT.update({
+    "Tunnels": "تانل‌ها", "New tunnel": "تانل جدید", "Priority & mode": "اولویت و حالت", "Destination": "مقصد",
+    "Protocol": "پروتکل", "Settings": "تنظیمات", "Ports & create": "پورت‌ها و ساخت", "Destination server": "سرور مقصد",
+    "Next: check the protocols": "بعدی: بررسی پروتکل‌ها", "Check again": "بررسی دوباره", "Back": "قبلی", "Next": "بعدی",
+    "Create tunnel": "ساخت تانل", "main": "اصلی", "backup": "پشتیبان", "off": "خاموش", "Turn on": "روشن کردن",
+    "Turn off": "خاموش کردن", "Make main": "اصلی شود", "Your tunnels": "تانل‌های شما", "Not in use": "در حال استفاده نیست",
+    "Delete tunnel": "حذف تانل", "recommended": "پیشنهادی", "unavailable": "در دسترس نیست", "Tunnel created": "تانل ساخته شد",
+    "Open Tunnels": "باز کردن تانل‌ها", "Create another": "ساخت تانل دیگر", "New tunnel with this server": "تانل جدید با این سرور",
+    "Checking every protocol ...": "در حال بررسی همه‌ی پروتکل‌ها ...", "Check all (connect only)": "بررسی همه (فقط اتصال)",
+    "Test speed": "تست سرعت", "Route my ports through it": "پورت‌های من از این رد شوند",
+    "Back to the relay pool": "برگشت به استخر ریلی", "Name": "نام", "Port": "پورت",
+    "Ports to forward on this server": "پورت‌هایی که روی این سرور فوروارد شوند",
+    "Ports that also need UDP (optional)": "پورت‌هایی که UDP هم لازم دارند (اختیاری)",
+    "Main tunnel, keep the other working tunnels as backup (recommended)": "تانل اصلی؛ بقیه‌ی تانل‌های سالم پشتیبان بمانند (پیشنهادی)",
+    "Only this tunnel (turn the others off)": "فقط همین تانل (بقیه خاموش شوند)",
+
     "Servers": "سرورها", "Add a destination server": "افزودن سرور مقصد", "Add server": "افزودن سرور",
     "Name": "نام", "Server IP": "آی‌پی سرور", "Server": "سرور", "Remove": "حذف", "New code": "کد جدید",
     "You get ONE command to run once on that server. It installs night-tunnel there, builds every tunnel model and connects back here by itself. No SSH and no password are given to this panel.": "یک دستور می‌گیرید که فقط یک‌بار روی آن سرور اجرا می‌کنید. night-tunnel را همان‌جا نصب می‌کند، همه‌ی مدل‌های تانل را می‌سازد و خودش به این پنل وصل می‌شود. هیچ SSH یا رمزی به این پنل داده نمی‌شود.",
@@ -2219,6 +2234,7 @@ ICONS = {
     "shield": "<path d='M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z'/>",
     "terminal": "<path d='M4 17l6-6-6-6M12 19h8'/>",
     "settings": "<path d='M4 21v-7M4 10V3M12 21v-9M12 8V3M20 21v-5M20 12V3M1 14h6M9 8h6M17 16h6'/>",
+    "plus": "<path d='M12 5v14M5 12h14'/>",
     "wand": "<path d='M15 4V2M15 16v-2M8 9h2M20 9h2M17.8 11.8L19 13M17.8 6.2L19 5M3 21l9-9M12.2 6.2L11 5'/>",
 }
 MOON = ("<svg viewBox='0 0 24 24' fill='none' stroke='#fff' stroke-width='2' stroke-linecap='round' "
@@ -3154,49 +3170,494 @@ def render_server_card(st, d, s, rep):
     if pan.get("url"):
         body += (f"<p class=hint>Its own panel: <span class=mono>{esc(pan['url'])}</span> user <span class=mono>{esc(pan.get('user', ''))}</span>"
                  + (f" password <span class=mono>{esc(pan['pw'])}</span>" if pan.get("pw") else "") + "</p>")
-    if not busy:
-        body += ("<div class=row>"
-                 + form({"a": "srvtest", "id": sid, "full": "1", "tab": "servers"}, "<button class=btn>Test all tunnels (fast)</button>", cls="inl")
-                 + form({"a": "srvtest", "id": sid, "full": "0", "tab": "servers"}, "<button class='btn g'>Quick check (connect only)</button>", cls="inl")
-                 + form({"a": "srvtest", "id": sid, "full": "2", "tab": "servers"}, "<button class='btn g'>Full test (speed on all)</button>", cls="inl")
-                 + rm + "</div>")
-    else:
-        body += "<p class=mu>A test is running. Watch it in the Test tab.</p>"
-    out = card("Server", body, "Tests run through the real tunnels: connection, latency, stability (16 probes) and real speed.")
-    if (not busy and rep and s.get("tested_ts") and rep.get("ts") == s["tested_ts"] and d["active"] == sid):
-        best = bench_best(rep)
-        ok = sorted([r for r in rep["results"] if r.get("ok")], key=lambda r: -r.get("score", 0))
-        opts = "<option value=auto>Recommended" + (f" ({esc(best)})" if best else "") + "</option>" + "".join(
-            f"<option value='{esc(r['name'])}'>{esc(r['name'])} - {BV_LABEL[bench_verdict(r)]}, "
-            f"stability {bench_stab(r)}%"
-            + (f", {r['down']}/{r['up']} Mb/s" if "down" in r else "") + "</option>" for r in ok)
-        cur = ",".join(str(p["port"]) for p in st.get("ports", [])) or "443"
-        hero = ""
-        if best:
-            b = next(r for r in rep["results"] if r["name"] == best)
-            hero = (f"<p><b class=mono>{esc(best)}</b> {bpill(bench_verdict(b))} <span class=mu>latency {b['rtt']} ms, "
-                    f"stability {bench_stab(b)}%" + (f", down {b['down']} / up {b['up']} Mb/s" if "down" in b else "") + "</span></p>")
-        out += card("Build the tunnel",
-                    hero + form({"a": "srvcreate", "id": sid, "tab": "servers"},
-                                "<div class=row>" + fld("Tunnel type", f"<select name=tunnel>{opts}</select>")
-                                + fld("Ports to forward on this server", f"<input name=ports value='{esc(cur)}' class='ltr w-m'>")
-                                + fld("Ports that also need UDP (optional)", "<input name=udp class='ltr w-m'>") + "</div>"
-                                "<p><label class=ck><input type=checkbox name=backup checked> Keep the other working tunnels as backup</label></p>"
-                                "<p><button class=btn>Create tunnel</button></p>"),
-                    "We suggest the best one, but you decide. Compare everything in the Test tab. "
-                    "The destination server is configured automatically.", cls="ok")
-    return out
+    go = ("" if busy else form({"a": "nwsel", "sid": sid, "tab": "newtunnel"},
+                               "<button class=btn>New tunnel with this server</button>", cls="inl"))
+    body += f"<div class=row>{go}{rm}</div>"
+    return card("Server", body, "Create tunnels in the New tunnel page and manage them in the Tunnels page.")
+
+
+# ---------------------------------------------------------- v1.8: separate "Tunnels" page and "New tunnel" wizard
+NW = {"step": 1, "sid": "", "type": "", "name": "", "port": "", "sni": "", "path": "", "host": "",
+      "ports": "", "udp": "", "use": "main"}
+NW_STEPS = ["Destination", "Protocol", "Settings", "Ports & create"]
+NAME_RE = re.compile(r"[a-z0-9][a-z0-9_-]{0,23}")
+
+
+def nw_reset():
+    NW.update(step=1, sid="", type="", name="", port="", sni="", path="", host="", ports="", udp="", use="main")
+
+
+def active_server():
+    d = srv_load()
+    return srv_find(d, d["active"]) if d.get("active") else None
+
+
+def bench_report():
+    try:
+        with open(BENCH) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def tn_agent(cmd, arg):
+    """Ask the destination to add / edit / delete a tunnel, then adopt its new token here. Returns its message."""
+    s = active_server()
+    if not s or not s.get("agent"):
+        raise RuntimeError("the destination has no control channel: change it on the foreign panel, then Sync the token here")
+    try:
+        back = agent_call(s, cmd, json.dumps(arg))
+    except RuntimeError as e:
+        if "unknown command" in str(e):
+            raise RuntimeError("the destination runs an older night-tunnel: update it first (its menu 10)")
+        raise
+    st = load()
+    m = op_import_token(st, back["token"])
+    if m.startswith(ERR):
+        raise RuntimeError(m.lstrip(ERR))
+    apply(load())
+    return (back.get("msg") or "").split(". Copy")[0]
+
+
+def tn_testline(r):
+    if not r:
+        return "<span class=mu>not tested yet</span>"
+    if not r.get("ok"):
+        return f"<span class=mu>last test: failed ({esc(r.get('err', ''))})</span>"
+    extra = f", {r['down']}/{r['up']} Mb/s" if "down" in r else ""
+    return f"{bpill(bench_verdict(r))} <span class=mu>{r['rtt']} ms, stability {bench_stab(r)}%{extra}</span>"
+
+
+def tn_card(st, t, pr, byn, main_id, kports):
+    tid, direct, tt = t["id"], t["via"] == "direct", ttype(t)
+    role = ("<span class='pill plain'>off</span>" if not t["enabled"] else
+            "<span class='pill up'>main</span>" if tid == main_id else "<span class='pill udp'>backup</span>")
+    r = byn.get(tid) or byn.get("kernel:" + tid)
+    acts = form({"a": "tntoggle", "id": tid, "tab": "tunnels"},
+                f"<button class='btn g s'>{'Turn off' if t['enabled'] else 'Turn on'}</button>", cls="inl")
+    if t["enabled"] and tid != main_id:
+        acts += form({"a": "tnmain", "id": tid, "tab": "tunnels"}, "<button class='btn g s'>Make main</button>", cls="inl")
+    f = ""
+    if direct:
+        f += fld("Type", "<select name=new_type>" + "".join(
+            f"<option {'selected' if k == tt else ''}>{k}</option>" for k in CATALOG) + "</select>")
+    f += fld("Port", f"<input name=port value={t['port']} class=w-s>")
+    if direct and tt in TLS_DIALERS:
+        f += fld("SNI", f"<input name=sni value='{esc(t.get('sni', ''))}' placeholder=global class=w-m>")
+    if direct and tt in WS_TYPES:
+        f += (fld("Path", f"<input name=path value='{esc(t.get('path', ''))}' placeholder=/ws class=w-s>")
+              + fld("Host", f"<input name=host value='{esc(t.get('host', ''))}' class=w-m>"))
+    det = form({"a": "tnedit", "id": tid, "tab": "tunnels"}, f + "<button class='btn g'>Save</button>", cls="row")
+    if not direct:
+        n = kports.get(t["via"], 0)
+        det += (f"<p class=hint>Kernel path: {n} forwarded port(s) use it directly.</p><div class=row>"
+                + form({"a": "tnkernel", "id": tid, "tab": "tunnels"}, "<button class='btn g s'>Route my ports through it</button>", cls="inl")
+                + form({"a": "tnpool", "id": tid, "tab": "tunnels"}, "<button class='btn g s'>Back to the relay pool</button>", cls="inl")
+                + "</div>")
+    det += "<div class=row style='margin-top:10px'>" + form(
+        {"a": "tndel", "id": tid, "tab": "tunnels"}, "<button class='btn d s'>Delete tunnel</button>",
+        confirm="Delete this tunnel on both servers?", cls="inl") + "</div>"
+    return (f"<div class='tc{'' if t['enabled'] else ' off'}'><div class=hd><b>{esc(tid)}</b> {role} {encpill(t)} "
+            f"{pill(pr.get(tid, 'down'), tp=tid)}<span class=grow></span>{acts}</div>"
+            f"<div class=meta><span class=mu>{esc(tdesc(t))} &middot; port <span class=mono>{t['port']}</span></span></div>"
+            f"<div class=meta>{tn_testline(r)}</div><details><summary>Settings</summary>{det}</details></div>")
+
+
+def render_tunnels_iran(st, pr):
+    rep = bench_report()
+    byn = {r["name"]: r for r in (rep or {}).get("results", [])}
+    s = active_server()
+    on = [t for t in st["transports"] if t["enabled"]]
+    off = [t for t in st["transports"] if not t["enabled"]]
+    main_id = on[0]["id"] if on else None
+    kports = {}
+    for p in st.get("ports", []):
+        if p.get("via"):
+            kports[p["via"]] = kports.get(p["via"], 0) + 1
+    head = (f"<p>Destination: <b>{esc(s['name'])}</b> <span class='mono mu'>{esc(s['ip'])}</span></p>" if s else
+            f"<p>Destination: <span class='mono'>{esc(st['foreign_ip'])}</span></p>")
+    tools = "<div class=row><button type=button class=btn data-tab=newtunnel>New tunnel</button>"
+    if s and not (BENCH_STATE["running"] or WIZ["running"]):
+        tools += form({"a": "srvtest", "id": s["id"], "full": "0", "tab": "tunnels"}, "<button class='btn g'>Check all (connect only)</button>", cls="inl")
+        tools += form({"a": "srvtest", "id": s["id"], "full": "1", "tab": "tunnels"}, "<button class='btn g'>Test speed</button>", cls="inl")
+    tools += "</div>"
+    o = card("", head + tools)
+    if len(st.get("ports", [])) and kports:
+        o += "<div class='flash'>Some ports go straight through a kernel path; the relay tunnels below carry the rest.</div>"
+    o += card("Your tunnels", "".join(tn_card(st, t, pr, byn, main_id, kports) for t in on) or "<p class=mu>None is on.</p>",
+              "The first one carries the traffic; the others take over automatically if it fails.")
+    if off:
+        o += card("Not in use", "".join(tn_card(st, t, pr, byn, main_id, kports) for t in off))
+    return o
+
+
+def tn_act(f):
+    a, tid = f.get("a"), f.get("id", "")
+    st = load()
+    if a == "tntoggle":
+        t = find_tp(st, tid)
+        if not t:
+            return ERR + "Unknown tunnel."
+        if t["enabled"] and sum(1 for x in st["transports"] if x["enabled"]) <= 1:
+            return ERR + "At least one tunnel must stay on."
+        t["enabled"] = not t["enabled"]
+        save(st)
+        apply(st)
+        return f"{tid} turned {'on' if t['enabled'] else 'off'}."
+    if a in ("tnmain", "tnkernel", "tnpool"):
+        name = tid if a == "tnmain" else ("kernel:" + tid if a == "tnkernel" else "pool")
+        m = op_use_tunnel(st, name)
+        if not m.startswith(ERR):
+            save(st)
+            apply(st)
+        return m
+    if a in ("tnedit", "tndel"):
+        try:
+            if a == "tndel":
+                return tn_agent("tpdel", {"id": tid}) or f"{tid} deleted."
+            return tn_agent("tpedit", {"id": tid, "port": f.get("port", ""), "sni": f.get("sni"), "path": f.get("path"),
+                                       "host": f.get("host"), "new_type": f.get("new_type", "")}) or "Saved."
+        except Exception as e:
+            return ERR + str(e)
+    return ERR + "Unknown action."
+
+
+# ---- New tunnel wizard
+def nw_results(sid):
+    d = srv_load()
+    s = srv_find(d, sid)
+    rep = bench_report()
+    if s and rep and d.get("active") == sid and s.get("tested_ts") and rep.get("ts") == s["tested_ts"]:
+        return rep, s
+    return None, s
+
+
+def nw_start_check(sid):
+    d = srv_load()
+    s = srv_find(d, sid)
+    if not s or s["status"] == "waiting":
+        return ERR + "Pick a server that has joined."
+    if WIZ["running"] or BENCH_STATE["running"]:
+        return ERR + "Something is already running."
+    s["test_start"] = int(time.time())
+    srv_save(d)
+    BENCH_STATE.update(running=True, log=["starting"])
+    threading.Thread(target=srv_test_bg, args=(sid, "quick"), daemon=True).start()
+    return "Checking every protocol between the two servers ..."
+
+
+def nw_stepper():
+    o = "<div class=steps>"
+    for i, n in enumerate(NW_STEPS, 1):
+        c = "on" if i == NW["step"] else ("done" if i < NW["step"] else "")
+        o += f"<div class='stp {c}'><i>{'&#10003;' if i < NW['step'] else i}</i><span>{n}</span></div>"
+    return o + "</div>"
+
+
+def nw_back_form(extra=""):
+    return form({"a": "nwback", "tab": "newtunnel"}, "<button class='btn g'>Back</button>", cls="inl") + extra
+
+
+def nw_step1():
+    joined = [s for s in srv_load()["servers"] if s["status"] != "waiting"]
+    if not joined:
+        return card("Destination server", "<p>No server has joined yet.</p><p><button type=button class=btn data-tab=servers>Add a server</button></p>",
+                    "Add the destination (exit) server in the Servers page first.")
+    opts = ""
+    for i, s in enumerate(joined):
+        chk = "checked" if (NW["sid"] == s["id"] or (not NW["sid"] and i == 0)) else ""
+        opts += (f"<label class=opt><input type=radio name=sid value='{esc(s['id'])}' {chk}>"
+                 f"<span><b>{esc(s['name'])}</b> <span class='mono mu'>{esc(s['ip'])}</span></span></label>")
+    return card("Destination server",
+                form({"a": "nwsel", "tab": "newtunnel"},
+                     f"<div class=opts>{opts}</div><p><button class=btn>Next: check the protocols</button></p>"),
+                "Pick the server the tunnel should end at. Before anything is built, the panel tests every protocol between "
+                "the two servers.")
+
+
+def nw_step2():
+    if BENCH_STATE["running"] or WIZ["running"]:
+        lg = [x.lstrip(ERR) for x in BENCH_STATE.get("log", [])][-6:] + WIZ["log"][-4:]
+        pct = int(100 * BENCH_STATE.get("done", 0) / BENCH_STATE["total"]) if BENCH_STATE.get("total") else 5
+        return card("Checking every protocol ...",
+                    f"<div class=nbar><i style='width:{pct}%'></i></div><pre class='log wizlog'>{esc(chr(10).join(lg))}</pre>",
+                    "Connection, latency and stability of each type between the two servers. This page updates by itself.")
+    rep, s = nw_results(NW["sid"])
+    again = form({"a": "nwcheck", "tab": "newtunnel"}, "<button class='btn g'>Check again</button>", cls="inl")
+    if not rep:
+        return card("Protocol", "<p>There is no result for this server yet.</p>" + again + nw_back_form())
+    best, byn, o = bench_best(rep), {r["name"]: r for r in rep["results"]}, ""
+    for layer, ids in LAYERS:
+        items = ""
+        for k in ids:
+            key = k if k in CATALOG else "kernel:" + k
+            r = byn.get(key)
+            label = k if k in CATALOG else CARRIERS[k][0] + " (kernel)"
+            dsc = CATALOG[k][2] if k in CATALOG else "kernel path, fastest, no failover"
+            dis = ""
+            if r and r.get("ok"):
+                chip = tn_testline(r)
+            elif r:
+                chip, dis = f"<span class='pill down'>unavailable</span> <span class=mu>{esc(r.get('err', ''))}</span>", "disabled"
+            else:
+                chip, dis = "<span class=mu>not tested</span>", "disabled"
+            star = "<span class='pill up'>recommended</span>" if key == best else ""
+            sel = "checked" if (NW["type"] == key or (not NW["type"] and key == best)) and not dis else ""
+            items += (f"<label class='opt{' offc' if dis else ''}'><input type=radio name=type value='{esc(key)}' {dis} {sel}>"
+                      f"<span><b>{esc(label)}</b> {star} <span class=mu>{esc(dsc)}</span><br>{chip}</span></label>")
+        o += f"<h3 class=lay>{esc(layer)}</h3><div class=opts>{items}</div>"
+    return card("Protocol", form({"a": "nwtype", "tab": "newtunnel"}, o + "<p><button class=btn>Next</button></p>"),
+                f"Tested between this server and {esc((s or {}).get('name', ''))}. The recommended one has the best score; you decide.") \
+        + "<p>" + nw_back_form(again) + "</p>"
+
+
+def nw_name_default(st, t):
+    names = {x["id"] for x in st["transports"] if x["enabled"]}
+    if t not in names:
+        return t
+    i = 2
+    while f"{t}-{i}" in names:
+        i += 1
+    return f"{t}-{i}"
+
+
+def nw_step3(st):
+    t = NW["type"]
+    f = (fld("Name", f"<input name=name value='{esc(NW['name'] or nw_name_default(st, t))}' class=w-m>")
+         + fld("Port on the destination (empty = automatic)", f"<input name=port value='{esc(NW['port'])}' class='ltr w-s'>"))
+    if t in TLS_DIALERS:
+        f += fld("SNI (empty = global)", f"<input name=sni value='{esc(NW['sni'])}' class='ltr w-m'>")
+    if t in WS_TYPES:
+        f += (fld("Path", f"<input name=path value='{esc(NW['path'])}' placeholder=/ws class='ltr w-s'>")
+              + fld("Host", f"<input name=host value='{esc(NW['host'])}' class='ltr w-m'>"))
+    return card(f"Settings for {esc(t)}", form({"a": "nwset", "tab": "newtunnel"},
+                f"<div class=row>{f}</div><p><button class=btn>Next</button></p>"),
+                "You can build several tunnels of one type: give each its own name, port or SNI.") + "<p>" + nw_back_form() + "</p>"
+
+
+def nw_step4(st):
+    kern = NW["type"].startswith("kernel:")
+    cur = ", ".join(str(p["port"]) for p in st.get("ports", []))
+    ports = NW["ports"] or ("" if cur else "443")
+    use = ""
+    if not kern:
+        use = ("<p><label class=ck><input type=radio name=use value=main " + ("checked" if NW["use"] != "only" else "") +
+               "> Main tunnel, keep the other working tunnels as backup (recommended)</label></p>"
+               "<p><label class=ck><input type=radio name=use value=only " + ("checked" if NW["use"] == "only" else "") +
+               "> Only this tunnel (turn the others off)</label></p>")
+    what = NW["type"] if kern else f"{NW['name'] or NW['type']} ({NW['type']})"
+    body = (f"<p>Tunnel: <b class=mono>{esc(what)}</b></p>"
+            + (f"<p class=hint>Ports already forwarded: {esc(cur)}</p>" if cur else "")
+            + "<div class=row>" + fld("Ports to forward on this server" + (" (added to the current ones)" if cur else ""),
+                                      f"<input name=ports value='{esc(ports)}' class='ltr w-m'>")
+            + fld("Ports that also need UDP (optional)", f"<input name=udp value='{esc(NW['udp'])}' class='ltr w-m'>") + "</div>"
+            + use + "<p><button class=btn>Create tunnel</button></p>")
+    return card("Ports & create", form({"a": "nwcreate", "tab": "newtunnel"}, body),
+                "Each port on this server is sent through the tunnel to 127.0.0.1 on the destination.") \
+        + "<p>" + nw_back_form() + "</p>"
+
+
+def render_newtunnel(st):
+    o = ""
+    if WIZ["error"] and not WIZ["running"]:
+        o += f"<div class='flash e'>{esc(WIZ['error'])}</div>"
+    if NW["step"] == 5:
+        return o + card("Tunnel created",
+                        f"<p>{esc(WIZ.get('notice') or 'Done.')}</p><p><button type=button class=btn data-tab=tunnels>Open Tunnels</button> "
+                        + form({"a": "nwreset", "tab": "newtunnel"}, "<button class='btn g'>Create another</button>", cls="inl") + "</p>", cls="ok")
+    if WIZ["running"] and NW["step"] == 4:
+        return o + wiz_running()
+    o += nw_stepper()
+    step = NW["step"]
+    if step == 1:
+        return o + nw_step1()
+    if step == 2:
+        return o + nw_step2()
+    if step == 3:
+        return o + nw_step3(st)
+    return o + nw_step4(st)
+
+
+def nw_create_bg(p):
+    WIZ.update(running=True, log=["Preparing the destination ..."], result=None, error="", notice="")
+    try:
+        sid, t = p["sid"], p["type"]
+        st = srv_activate(sid)
+        rep, s = nw_results(sid)
+        ports = parse_ports(p["ports"], p["udp"])
+        if t.startswith("kernel:"):
+            c = t[7:]
+            if c not in (st.get("l3") or {}):
+                raise RuntimeError("that kernel tunnel does not exist on the destination")
+            if not ports:
+                raise RuntimeError("enter at least one port for the kernel path")
+            WIZ["log"].append("Routing the ports through the kernel tunnel ...")
+            for pt in ports:
+                if any(x["port"] == pt["port"] for x in st["ports"]):
+                    m = op_port_edit(st, str(pt["port"]), str(pt["port"]), pt["proto"], "", c)
+                else:
+                    m = op_port_add(st, str(pt["port"]), pt["proto"], "", c)
+                if m.startswith(ERR):
+                    raise RuntimeError(m.lstrip(ERR))
+            save(st)
+            apply(st)
+            note = f"Ports {', '.join(str(x['port']) for x in ports)} now go through the {CARRIERS[c][0]} kernel tunnel."
+        else:
+            name = p["name"] or t
+            WIZ["log"].append("Creating the tunnel on the destination ...")
+            arg = {"type": t, "name": name, "port": p["port"], "sni": p["sni"], "path": p["path"], "host": p["host"]}
+            try:
+                tn_agent("tpadd", arg)
+            except RuntimeError as e:
+                if "already exists" not in str(e):
+                    raise
+                if find_tp(load(), name) and find_tp(load(), name)["enabled"]:
+                    raise RuntimeError(f"a tunnel named {name} is already in use; choose another name")
+                WIZ["log"].append("Switching on the existing model and applying your settings ...")
+                ids = [x["id"] for x in load()["transports"] if x["enabled"]] + [name]
+                back = agent_call(s, "keep", ",".join(ids))
+                m = op_import_token(load(), back["token"])
+                if m.startswith(ERR):
+                    raise RuntimeError(m.lstrip(ERR))
+                if p["port"] or p["sni"] or p["path"] or p["host"]:
+                    tn_agent("tpedit", {"id": name, "port": p["port"], "sni": p["sni"] or None,
+                                        "path": p["path"] or None, "host": p["host"] or None})
+            st = load()
+            t0 = find_tp(st, name)
+            if not t0:
+                raise RuntimeError("the destination did not report the new tunnel")
+            t0["enabled"] = True
+            WIZ["log"].append("Adding your ports ...")
+            have = {x["port"] for x in st.get("ports", [])}
+            for pt in ports:
+                if pt["port"] not in have:
+                    m = op_port_add(st, str(pt["port"]), pt["proto"], "", "")
+                    if m.startswith(ERR):
+                        raise RuntimeError(m.lstrip(ERR))
+            sv = srv_find(srv_load(), sid) or {}
+            first = not sv.get("built")
+            others = [x["id"] for x in st["transports"] if x["enabled"] and x["id"] != name]
+            if first and rep:
+                others = [r["name"] for r in sorted(rep["results"], key=lambda r: -r.get("score", 0))
+                          if r.get("ok") and r.get("kind") == "relay" and r["name"] != name and find_tp(st, r["name"])][:3]
+            if p["use"] == "only":
+                msg = op_use_tunnel(st, name, only=True)
+            else:
+                msg = op_use_tunnel(st, name)
+                op_set_ids(st, [name] + others)
+            if msg.startswith(ERR):
+                raise RuntimeError(msg.lstrip(ERR))
+            st["strategy"] = "fifo"
+            save(st)
+            apply(st)
+            keep = [x["id"] for x in st["transports"] if x["enabled"]]
+            try:   # the destination now runs only these; adopt its list so both sides always agree
+                back = agent_call(s, "keep", ",".join(keep))
+                op_import_token(load(), back["token"])
+                apply(load())
+            except Exception:
+                pass
+            note = (f"{name} is the main tunnel" + ("; " + ", ".join(others) + " stay as backup." if p["use"] != "only" and others else " (only).")
+                    + f" Ports: {', '.join(str(x['port']) for x in load().get('ports', []))}.")
+        d = srv_load()
+        s2 = srv_find(d, sid)
+        if s2:
+            s2["status"] = "active"
+            s2["built"] = s2.get("built", 0) + 1
+            srv_save(d)
+        WIZ["notice"] = note
+        NW["step"] = 5
+    except Exception as e:
+        WIZ["error"] = f"Could not create the tunnel: {e}"
+    finally:
+        WIZ["running"] = False
+
+
+def nw_act(f):
+    a = f.get("a")
+    if a == "nwreset":
+        nw_reset()
+        WIZ["notice"] = ""
+        return ""
+    if a == "nwsel":
+        sid = f.get("sid", "")
+        s = srv_find(srv_load(), sid)
+        if not s or s["status"] == "waiting":
+            return ERR + "Pick a server that has joined."
+        NW.update(sid=sid, step=2, type="")
+        rep, _ = nw_results(sid)
+        if rep and time.time() - rep["ts"] < 600:
+            return "Using the check from a minute ago. Use 'Check again' for a fresh one."
+        return nw_start_check(sid)
+    if a == "nwcheck":
+        return nw_start_check(NW["sid"])
+    if a == "nwback":
+        NW["step"] = 2 if (NW["step"] == 4 and NW["type"].startswith("kernel:")) else max(1, NW["step"] - 1)
+        return ""
+    if a == "nwtype":
+        rep, _ = nw_results(NW["sid"])
+        t = f.get("type", "")
+        if not rep or not any(r["name"] == t and r.get("ok") for r in rep["results"]):
+            return ERR + "Choose a protocol that passed the check."
+        NW.update(type=t, step=4 if t.startswith("kernel:") else 3)
+        return ""
+    if a == "nwset":
+        name = f.get("name", "").strip().lower() or NW["type"]
+        if not NAME_RE.fullmatch(name):
+            return ERR + "Name: lowercase letters, digits, - or _ (max 24)."
+        port = f.get("port", "").strip()
+        if port and not (port.isdigit() and 1 <= int(port) <= 65535 and int(port) != 22):
+            return ERR + "Invalid port."
+        for k in ("sni", "path", "host"):
+            v = f.get(k, "").strip()
+            if v and not re.fullmatch(r"[A-Za-z0-9._/~-]{1,120}", v):
+                return ERR + f"Invalid {k}."
+            NW[k] = v
+        NW.update(name=name, port=port, step=4)
+        return ""
+    if a == "nwcreate":
+        if WIZ["running"]:
+            return ERR + "Something is already running."
+        ports = parse_ports(f.get("ports", ""), f.get("udp", ""))
+        st = load_any()
+        if not ports and not (st.get("ports") and not NW["type"].startswith("kernel:")):
+            return ERR + "Enter at least one port to forward (e.g. 443)."
+        NW.update(ports=f.get("ports", ""), udp=f.get("udp", ""), use="only" if f.get("use") == "only" else "main")
+        p = {k: NW[k] for k in NW}
+        threading.Thread(target=nw_create_bg, args=(p,), daemon=True).start()
+        WIZ.update(running=True, log=["Starting ..."], error="")
+        return "Creating the tunnel. This page refreshes by itself."
+    return ERR + "Unknown action."
+
+
+CSS += """
+.steps{display:flex;gap:8px;margin:0 0 16px;flex-wrap:wrap}
+.stp{display:flex;align-items:center;gap:8px;padding:8px 14px;border-radius:12px;border:1px solid var(--line);color:var(--mu);font-size:13px}
+.stp i{display:inline-grid;place-items:center;width:22px;height:22px;border-radius:50%;border:1px solid var(--line2);font-style:normal;font-size:12px}
+.stp.on{color:var(--tx);border-color:var(--ac);background:rgba(124,140,255,.12)}.stp.on i{background:var(--ac);border-color:var(--ac);color:#fff}
+.stp.done{color:var(--ok)}.stp.done i{border-color:var(--ok)}
+.opts{display:grid;grid-template-columns:repeat(auto-fill,minmax(250px,1fr));gap:10px;margin-bottom:6px}
+.opt{display:flex;gap:10px;align-items:flex-start;padding:12px 14px;border:1px solid var(--line);border-radius:12px;cursor:pointer;line-height:1.5}
+.opt:has(input:checked){border-color:var(--ac);background:rgba(124,140,255,.10)}.opt.offc{opacity:.5;cursor:not-allowed}
+.opt input{margin-top:5px}.lay{margin:16px 0 8px;font-size:13px;color:var(--mu);font-weight:650}
+.tc{padding:14px 0;border-bottom:1px solid var(--line)}.tc:last-child{border-bottom:0;padding-bottom:0}.tc.off{opacity:.65}
+.tc .meta{margin:4px 0}.tc details{margin-top:8px}.tc summary{cursor:pointer;color:var(--mu);font-size:13px}
+.nbar{height:8px;border-radius:99px;background:var(--line);overflow:hidden;margin-bottom:12px}
+.nbar i{display:block;height:100%;background:linear-gradient(90deg,var(--ac),var(--ac2));transition:width .4s}
+"""
+
 
 
 def tabs_for(st):
     if st["role"] == "new":
-        return [("servers", "Servers", "layers"), ("manual", "Manual setup", "tunnel"), ("telegram", "Telegram proxy", "send"),
-                ("logs", "Logs", "terminal"), ("system", "System", "settings")]
+        return [("servers", "Servers", "layers"), ("newtunnel", "New tunnel", "plus"), ("manual", "Manual setup", "tunnel"),
+                ("telegram", "Telegram proxy", "send"), ("logs", "Logs", "terminal"), ("system", "System", "settings")]
     t = [("overview", "Overview", "home")]
     if st["role"] == "iran":
-        t.append(("servers", "Servers", "layers"))
-    t += [("transports", "Transports", "layers")]
-    t.append(("ports", "Ports", "swap") if st["role"] == "iran" else ("tunnels", "Tunnels", "tunnel"))
+        t += [("servers", "Servers", "layers"), ("tunnels", "Tunnels", "tunnel"), ("newtunnel", "New tunnel", "plus"),
+              ("transports", "Priority & mode", "swap"), ("ports", "Ports", "swap")]
+    else:
+        t += [("transports", "Transports", "layers"), ("tunnels", "Tunnels", "tunnel")]
     return t + [("token", "Token", "key"), ("test", "Test", "gauge"), ("telegram", "Telegram proxy", "send"),
                 ("security", "Security", "shield"), ("logs", "Logs", "terminal"), ("system", "System", "settings")]
 
@@ -3205,11 +3666,12 @@ def render_page(st, msg=""):
     new = st["role"] == "new"
     states = svc_states()
     pr = {} if new else probe_all(st)
-    secs = {"servers": lambda: render_servers(st), "manual": render_manual, "telegram": lambda: render_tg(st), "logs": render_logs,
+    secs = {"servers": lambda: render_servers(st), "newtunnel": lambda: render_newtunnel(st), "manual": render_manual, "telegram": lambda: render_tg(st), "logs": render_logs,
             "system": lambda: render_system(st)}
     if not new:
         secs.update({"overview": lambda: render_overview(st, states, pr), "transports": lambda: render_transports(st, pr),
-                     "ports": lambda: render_ports(st), "tunnels": lambda: render_tunnels(st),
+                     "ports": lambda: render_ports(st),
+                     "tunnels": (lambda: render_tunnels_iran(st, pr)) if st["role"] == "iran" else (lambda: render_tunnels(st)),
                      "token": lambda: render_token(st), "test": lambda: render_bench(st),
                      "security": lambda: render_security(st)})
     tabs = tabs_for(st)
@@ -3404,6 +3866,8 @@ class Handler(BaseHTTPRequestHandler):
             return manual_start(a, f)
         if a and a.startswith("srv"):
             return srv_act(f)
+        if a and a.startswith("nw"):
+            return nw_act(f)
         return sys_act({"role": "new", "panel": load_any()["panel"]}, a, f) or ""
 
     def act(self, st, f):
@@ -3412,6 +3876,10 @@ class Handler(BaseHTTPRequestHandler):
             return self.act_new(f)
         if a and a.startswith("srv"):
             return srv_act(f) if st["role"] == "iran" else ERR + "Servers are managed from the Iran (entry) panel."
+        if a and a.startswith(("nw", "tn")):
+            if st["role"] != "iran":
+                return ERR + "Tunnels are created and managed from the Iran (entry) panel."
+            return nw_act(f) if a.startswith("nw") else tn_act(f)
         if a in ("tgcreate", "tgedit", "tgrestart", "tgrotate", "tgremove", "wizclear", "chpw", "bbr",
                  "checkver", "update_script", "update_gost"):
             return sys_act(st, a, f)
@@ -4265,6 +4733,24 @@ def agent_serve(st, f, ip):
         if not ids:
             return 400, '{"err":"no valid tunnel"}'
         msg = op_set_ids(st, ids)
+        if msg.startswith(ERR):
+            return 400, json.dumps({"err": msg.lstrip(ERR)})
+        save(st)
+        apply(st)
+        out = {"ok": True, "msg": msg, "token": make_token(st)}
+    elif cmd in ("tpadd", "tpedit", "tpdel"):
+        try:
+            a = json.loads(f.get("arg") or "{}")
+            assert isinstance(a, dict)
+        except (ValueError, AssertionError):
+            return 400, '{"err":"bad arguments"}'
+        g = lambda k: None if a.get(k) is None else str(a.get(k))
+        if cmd == "tpadd":
+            msg = op_tp_add(st, g("type") or "", g("name") or "", g("port") or "", g("sni") or "", g("path") or "", g("host") or "")
+        elif cmd == "tpedit":
+            msg = op_tp_edit(st, g("id") or "", g("port") or "", g("sni"), g("path"), g("host"), g("new_type") or "")
+        else:
+            msg = op_tp_del(st, g("id") or "")
         if msg.startswith(ERR):
             return 400, json.dumps({"err": msg.lstrip(ERR)})
         save(st)
