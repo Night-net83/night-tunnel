@@ -8,7 +8,6 @@ Roles  : foreign (exit server) and iran (entry server)
 """
 import ast
 import base64
-import getpass
 import concurrent.futures
 import hashlib
 import hmac
@@ -34,7 +33,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
 NAME = "night-tunnel"
-VERSION = "1.5.0"
+VERSION = "1.7.0-agent-managed"
 BASE = os.environ.get("NT_BASE", "/etc/night-tunnel")
 STATE = BASE + "/state.json"
 GOST_CFG = BASE + "/gost.json"
@@ -89,7 +88,8 @@ KPOST = "NT-KP"
 KLOCK = "NT-LOCK"
 # transports whose payload is encrypted end-to-end (TLS / QUIC); WireGuard is the only encrypted carrier
 ENCRYPTED = {"tls", "mtls", "wss", "mwss", "grpc", "h2", "quic"}
-BOOT = BASE + "/boot.json"           # panel-only config (panel started before any tunnel exists)
+BOOT = BASE + "/boot.json"
+PEERS = BASE + "/peers.json"           # panel-only config (panel started before any tunnel exists)
 TGBASE = BASE + "-tg"                # Telegram proxy lives apart from the tunnel config (survives a tunnel reset)
 TG_STATE = TGBASE + "/tg.json"
 TG_CFG = TGBASE + "/mtg.toml"
@@ -1553,22 +1553,29 @@ def update_script():
         raw = open(OPT + "/repo").read().strip()
     except OSError:
         return ERR + "Repo URL unknown; reinstall with the one-line command."
-    tmp = OPT + "/nt.py.new"
+    tmp, agent_tmp = OPT + "/nt.py.new", OPT + "/agent.py.new"
     if sh(f"curl -fsSL --max-time 30 {shlex.quote(raw + '/nt.py')} -o {tmp}").returncode != 0:
         return ERR + "Download failed."
     try:
         src = open(tmp).read()
         ast.parse(src)
         assert 'NAME = "night-tunnel"' in src
+        ar = sh(f"curl -fsSL --max-time 30 {shlex.quote(raw + '/agent.py')} -o {agent_tmp}")
+        if ar.returncode == 0:
+            ast.parse(open(agent_tmp).read())
     except Exception:
-        os.remove(tmp)
+        for f in (tmp, agent_tmp):
+            if os.path.exists(f): os.remove(f)
         return ERR + "Downloaded file is invalid; kept the current version."
     m = re.search(r'^VERSION = "([^"]+)"', src, re.M)
     os.replace(tmp, OPT + "/nt.py")
     os.chmod(OPT + "/nt.py", 0o700)
+    if os.path.exists(agent_tmp):
+        os.replace(agent_tmp, OPT + "/agent.py")
+        os.chmod(OPT + "/agent.py", 0o700)
+        sh("systemctl restart night-tunnel-agent")
     sh("systemd-run --no-block --collect sh -c 'sleep 2; systemctl restart night-tunnel-panel'")
     return f"Script updated {VERSION} -> {m.group(1) if m else '?'}. Panel restarts in a moment."
-
 
 def update_gost():
     arch = {"x86_64": "amd64", "aarch64": "arm64", "arm64": "arm64", "armv7l": "armv7"}.get(os.uname().machine)
@@ -1857,7 +1864,18 @@ FA_TEXT = {
     # navigation / titles
     "Overview": "نمای کلی", "Transports": "ترنسپورت‌ها", "Ports": "پورت‌ها", "Tunnels": "تانل‌ها", "Token": "توکن",
     "Test": "تست", "Telegram proxy": "پروکسی تلگرام", "Security": "امنیت", "Logs": "لاگ‌ها", "System": "سیستم",
-    "Easy setup": "نصب آسان", "Logout": "خروج", "Login": "ورود", "Sign in to the control panel": "ورود به پنل مدیریت",
+    "Easy setup": "نصب آسان", "Servers": "سرورها", "Server name": "نام سرور", "Destination IPv4": "IPv4 مقصد",
+    "Master public IP / hostname": "IP عمومی پنل اصلی / نام میزبان", "Add server & generate connection command": "افزودن سرور و ساخت دستور اتصال",
+    "Build a tunnel between this panel and a registered server": "ساخت تانل بین این پنل و سرور ثبت‌شده",
+    "Registered destination": "سرور مقصد ثبت‌شده", "This panel server is": "نقش سرور فعلی",
+    "Iran (entry)": "ایران (ورودی)", "Foreign (exit)": "خارج (خروجی)", "Ports to forward": "پورت‌های فوروارد",
+    "UDP ports (optional)": "پورت‌های UDP (اختیاری)", "Domain (optional)": "دامنه (اختیاری)", "TLS SNI": "TLS SNI",
+    "Security": "امنیت", "Build both sides and test all tunnel types": "ساخت دو سمت و تست همه انواع تانل",
+    "Choose the tunnel on the remote Iran server": "انتخاب تانل روی سرور ایران مقصد",
+    "Use selected as main (keep backups)": "استفاده از انتخاب به‌عنوان اصلی (با حفظ پشتیبان‌ها)",
+    "Use the recommended option only": "فقط سریع‌ترین تانل",
+    "Managed tunnel setup finished": "ساخت خودکار تانل تمام شد",
+    "Logout": "خروج", "Login": "ورود", "Sign in to the control panel": "ورود به پنل مدیریت",
     "Iran · entry": "ایران · ورودی", "Foreign · exit": "خارج · خروجی", "Not configured": "تنظیم نشده",
     "user": "نام کاربری", "password": "رمز عبور", "Wrong credentials": "نام کاربری یا رمز اشتباه است",
     # states
@@ -2483,7 +2501,21 @@ def render_wiz_result():
          "<p class=hint>Shown once - save it now.</p>")
     if r.get("test"):
         h += f"<pre class=log>{esc(r['test'])}</pre>"
-    return card("Easy setup finished", h + form({"a": "wizclear"}, "<p><button class='btn g'>Dismiss</button></p>"), cls="ok")
+    if r.get("test_lines"):
+        h += "<ul class=rec>" + "".join(f"<li>{esc(x)}</li>" for x in r["test_lines"]) + "</ul>"
+    if r.get("remote_server_id") and r.get("test_results"):
+        candidates = [x for x in r["test_results"] if x.get("ok")]
+        candidates.sort(key=lambda x: x.get("score", 0), reverse=True)
+        if candidates:
+            opts = "".join(f"<option value='{esc(x['name'])}'>{esc(x['name'])} — {x.get('rtt', '-') } ms / {x.get('score', '-') } score</option>" for x in candidates)
+            h += card("Choose the tunnel on the remote Iran server",
+                form({"a":"server_select_tunnel", "id":r["remote_server_id"], "only":"0"},
+                     f"<select name=name>{opts}</select><p><button class=btn>Use selected as main (keep backups)</button></p>")
+                + form({"a":"server_select_tunnel", "id":r["remote_server_id"], "only":"1"},
+                       f"<input type=hidden name=name value='{esc(candidates[0]['name'])}'><p><button class='btn g'>Use the recommended option only</button></p>",
+                       confirm="Switch off every other tunnel and keep only the recommended candidate?"),
+                "The selected route is applied on the remote Iran entry server.")
+    return card("Managed tunnel setup finished", h + form({"a": "wizclear"}, "<p><button class='btn g'>Dismiss</button></p>"), cls="ok")
 
 
 def wiz_running():
@@ -2598,45 +2630,264 @@ def manual_start(a, f):
     return "Setup started. This page refreshes by itself."
 
 
-def render_setup():
-    run = WIZ["running"]
-    o = ""
-    if WIZ["error"] and not run:
-        o += f"<div class='flash e'>{esc(WIZ['error'])}</div>"
-    if run:
-        o += card("Setting up...", "<pre class='log wizlog'>" + esc("\n".join(WIZ["log"])) + "</pre>",
-                  "This page updates by itself. It can take a few minutes.")
-    else:
-        f = form({"a": "wizard"},
-                 "<div class=row>" + fld("This server is the", "<select name=role><option value=iran>Iran (entry) server</option>"
-                                         "<option value=foreign>foreign (exit) server</option></select>")
-                 + fld("IP of the OTHER server", "<input name=remote_ip class=w-m placeholder='203.0.113.10'>") + "</div>"
-                 "<div class=row style='margin-top:12px'>" + fld("SSH port", "<input name=ssh_port value=22 class=w-s>")
-                 + fld("SSH user", "<input name=ssh_user value=root class=w-m>")
-                 + fld("SSH password of the other server", "<input type=password name=ssh_pass autocomplete=off class=w-l>")
-                 + fld("or SSH key file on this server", "<input name=ssh_key class=w-l placeholder='/root/.ssh/id_ed25519'>") + "</div>"
-                 "<div class=row style='margin-top:12px'>"
-                 + fld("Security", "<select name=mode><option value=password>With password (encrypted, recommended)</option>"
-                       "<option value=open>No password (limited to the Iran IP)</option></select>")
-                 + fld("Ports to forward on the Iran server", "<input name=ports value=443 class=w-m placeholder='443,2053'>")
-                 + fld("Ports that also need UDP (optional)", "<input name=udp class=w-m>")
-                 + fld("This server's public IP (only if it cannot be detected)", "<input name=local_ip class='ltr w-m'>") + "</div>"
-                 "<p><label class=ck><input type=checkbox name=force> Overwrite an existing night-tunnel config on the other server</label></p>"
-                 "<p><button class=btn>Build the tunnel automatically</button></p>")
-        o += card("Easy setup", f,
-                  "Give the other server's IP and root SSH login. This server installs night-tunnel there, creates both "
-                  "sides of the tunnel and runs a first test. The SSH password is used once and not stored.")
-    return render_wiz_result() + o
+def peers_load():
+    try:
+        with open(PEERS) as f:
+            data = json.load(f)
+        return data if isinstance(data, list) else []
+    except (OSError, ValueError):
+        return []
 
+
+def peers_save(rows):
+    os.makedirs(BASE, exist_ok=True)
+    tmp = PEERS + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(rows, f, indent=2)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, PEERS)
+
+
+def render_servers():
+    rows = peers_load()
+    body = render_wiz_result()
+    if WIZ.get("running"):
+        body += wiz_running()
+    if WIZ.get("error") and not WIZ.get("running"):
+        body += f"<div class='flash e'>{esc(WIZ['error'])}</div>"
+    body += form({"a": "server_add"},
+        "<div class=row>" + fld("Server name", "<input name=name required placeholder='Germany' class=w-m>")
+        + fld("Destination IPv4", "<input name=ip required placeholder='203.0.113.10' class='ltr w-m'>")
+        + fld("Master public IP / hostname", "<input name=master required placeholder='198.51.100.10' class='ltr w-m'>")
+        + "</div><p><button class=btn>Add server &amp; generate connection command</button></p>")
+    body += "<p class=hint>اتصال اولیه با یک دستور یک‌بارمصرف روی سرور مقصد انجام می‌شود. پس از نصب Agent، دیگر SSH یا رمز عبور لازم نیست.</p>"
+    if rows:
+        body += "<div class=scroll><table class=tbl><tr><th>Name</th><th>IP</th><th>Agent</th><th>Last seen</th><th>Bootstrap command</th><th></th></tr>"
+        for r in rows:
+            status = "<span class='pill up'>Online</span>" if time.time()-r.get("last_seen",0)<90 else "<span class='pill down'>Offline</span>"
+            cmd = r.get("command", "")
+            body += (f"<tr><td><b>{esc(r['name'])}</b></td><td class=mono>{esc(r['ip'])}</td><td>{status}</td>"
+                     f"<td>{esc(time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(r.get('last_seen',0)))) if r.get('last_seen') else '—'}</td>"
+                     f"<td><div class=copy><input readonly value='{esc(cmd)}' id='peer-{esc(r['id'])}'><button type=button class='btn g s' data-copy='#peer-{esc(r['id'])}'>Copy</button></div></td>"
+                     f"<td><div class=row>{form({'a':'server_regenerate','id':r['id']}, '<button class=' + '"btn g s"' + '>New command</button>')}"
+                     f"{form({'a':'server_remove','id':r['id']}, '<button class=btn d s>Remove</button>', confirm='Remove this server from the panel?')}</div></td></tr>")
+        body += "</table></div>"
+        body += card("Build a tunnel between this panel and a registered server",
+            form({"a":"server_tunnel"},
+              "<div class=row>" + fld("Registered destination", "<select name=server_id required>" + "".join(
+                  f"<option value='{esc(r['id'])}'>{esc(r['name'])} — {esc(r['ip'])}</option>" for r in rows) + "</select>")
+              + fld("This panel server is", "<select name=local_role><option value=iran>Iran (entry)</option><option value=foreign>Foreign (exit)</option></select>")
+              + fld("Ports to forward", "<input name=ports value='443' class=w-m required placeholder='443,2053'>")
+              + fld("UDP ports (optional)", "<input name=udp class=w-m placeholder='443'>")
+              + "</div><div class=row style='margin-top:12px'>"
+              + fld("Domain (optional)", "<input name=domain class=w-l placeholder='example.com'>")
+              + fld("TLS SNI", "<input name=sni value='www.microsoft.com' class=w-l>")
+              + fld("Security", "<select name=mode><option value=password>Authenticated (recommended)</option><option value=open>Without password</option></select>")
+              + "</div><p class=hint>ساخت هر دو سمت به‌صورت خودکار انجام می‌شود. همه مدل‌های موجود ساخته می‌شوند، سپس تست اتصال، تأخیر، جیتر، Packet Loss و سرعت انجام می‌شود تا از تب Test بهترین گزینه را انتخاب کنید.</p>"
+              + "<p><button class=btn>Build both sides and test all tunnel types</button></p>"),
+            "این پنل باید روی یکی از دو سرور باشد؛ سرور ثبت‌شده، سمت مقابل خواهد بود.")
+    else:
+        body += "<p class=mu>هنوز سروری ثبت نشده است.</p>"
+    return card("Servers", body, "مدیریت مقصدها و ساخت خودکار تانل بدون ورود SSH")
+
+
+def server_add(f, panel):
+    name, ip, master = f.get("name", "").strip(), f.get("ip", "").strip(), f.get("master", "").strip()
+    if not name or len(name) > 48 or not valid_ip(ip):
+        return ERR + "Enter a server name and a valid IPv4 address."
+    if not re.match(r"^[A-Za-z0-9.-]{1,253}$", master):
+        return ERR + "Enter a valid public IP or hostname for this panel."
+    rows = peers_load()
+    if any(x["ip"] == ip for x in rows):
+        return ERR + "This IP is already registered."
+    sid, token = secrets.token_hex(8), secrets.token_urlsafe(32)
+    port = int(panel["port"])
+    row = {"id": sid, "name": name, "ip": ip, "token_hash": hashlib.sha256(token.encode()).hexdigest(),
+           "created": time.time(), "last_seen": 0, "master": master, "port": port, "path": panel["path"],
+           "command": "", "pending": None, "last_result": None}
+    scheme = "https"
+    # Enrollment token is short-lived and is invalidated after bootstrap is served.
+    row["bootstrap_expires"] = time.time() + 86400
+    row["command"] = (f"curl -kfsS '{scheme}://{master}:{port}/nt-agent/bootstrap?id={sid}&token={token}' | bash")
+    rows.append(row)
+    peers_save(rows)
+    return "Server added. Run the one-time bootstrap command on the destination as root."
+
+
+def server_regenerate(f, panel):
+    sid = f.get("id", "")
+    rows = peers_load()
+    row = next((x for x in rows if x.get("id") == sid), None)
+    if not row:
+        return ERR + "Registered server was not found."
+    if time.time() - row.get("last_seen", 0) < 90:
+        return ERR + "This Agent is online. Do not rotate its enrollment token; use the existing connection."
+    token = secrets.token_urlsafe(32)
+    row["token_hash"] = hashlib.sha256(token.encode()).hexdigest()
+    row["bootstrap_expires"] = time.time() + 86400
+    row["bootstrap_used"] = False
+    row["pending"] = None
+    row["last_result"] = None
+    row["command"] = (f"curl -kfsS 'https://{row['master']}:{row['port']}/nt-agent/bootstrap?id={sid}&token={token}' | bash")
+    peers_save(rows)
+    return "A new one-time bootstrap command was generated. The previous enrollment token is invalidated."
+
+
+def agent_issue(server_id, action, params, timeout=900):
+    """Queue one allow-listed action for an enrolled agent and wait for its result."""
+    rows = peers_load()
+    row = next((x for x in rows if x.get("id") == server_id), None)
+    if not row:
+        raise RuntimeError("Registered server was not found")
+    if time.time() - row.get("last_seen", 0) > 90:
+        raise RuntimeError("Destination Agent is offline; check its service and network")
+    if row.get("pending"):
+        raise RuntimeError("This destination is already processing another command")
+    cid = secrets.token_hex(12)
+    row["pending"] = {"id": cid, "action": action, "params": params, "created": time.time()}
+    row["last_result"] = None
+    peers_save(rows)
+    end = time.time() + timeout
+    while time.time() < end:
+        time.sleep(2)
+        rows = peers_load()
+        row = next((x for x in rows if x.get("id") == server_id), None)
+        if not row:
+            raise RuntimeError("Destination was removed while command was running")
+        result = row.get("last_result")
+        if result and result.get("id") == cid:
+            row["last_result"] = None
+            peers_save(rows)
+            if not result.get("ok"):
+                raise RuntimeError(result.get("error") or "Remote command failed")
+            return result.get("data") or {}
+    raise RuntimeError("Timed out waiting for destination Agent")
+
+
+def agent_tunnel_bg(p):
+    WIZ.update(running=True, log=["Starting managed tunnel setup..."], error="", notice="", result=None)
+    try:
+        sid, role = p["server_id"], p["local_role"]
+        rows = peers_load(); remote = next((x for x in rows if x.get("id") == sid), None)
+        if not remote:
+            raise RuntimeError("Select a registered destination server")
+        existing = None
+        if os.path.exists(STATE):
+            existing = load()
+            if existing.get("role") != role:
+                raise RuntimeError("Selected role does not match this server's existing tunnel role")
+        local_ip = public_ip()
+        if not valid_ip(local_ip):
+            raise RuntimeError("Could not detect this panel server public IPv4")
+        domain, sni = p.get("domain", ""), p.get("sni") or "www.microsoft.com"
+        if domain and not valid_host(domain): raise RuntimeError("Invalid domain")
+        if not valid_host(sni): raise RuntimeError("Invalid TLS SNI")
+        ports = parse_ports(p.get("ports", "443"), p.get("udp", ""))
+        if not ports: raise RuntimeError("Enter at least one valid forwarding port")
+        secure = p.get("secure", True)
+        WIZ["log"].append("Checking destination Agent...")
+        if role == "iran":
+            WIZ["log"].append("Installing/configuring foreign (exit) side on destination...")
+            remote_result = agent_issue(sid, "setup_foreign", {
+                "me": remote["ip"], "iran_ip": local_ip, "domain": "", "sni": sni,
+                "secure": secure, "transports": list(CATALOG), "carriers": list(CARRIERS)
+            })
+            WIZ["log"].append("Creating Iran (entry) side on this server...")
+            if existing:
+                st = existing
+                sync_msg = op_import_token(st, remote_result["token"])
+                if sync_msg.startswith(ERR): raise RuntimeError(sync_msg.lstrip(ERR))
+                for transport in st.get("transports", []):
+                    transport["enabled"] = True
+                known_ports = {x["port"] for x in st.get("ports", [])}
+                for item in ports:
+                    if item["port"] not in known_ports:
+                        add_msg = op_port_add(st, item["port"], item["proto"])
+                        if add_msg.startswith(ERR): raise RuntimeError(add_msg.lstrip(ERR))
+                save(st)
+                if not apply(st): raise RuntimeError("Could not apply the updated Iran configuration")
+            else:
+                st, _ = core_iran(parse_token(remote_result["token"]), domain, ports, reuse_panel=True)
+            start_bench(st)
+            WIZ["log"].append("Running full connectivity, stability and throughput tests...")
+            rep, err = run_bench(st, full=True, secs=4, log=lambda x: WIZ["log"].append(x))
+            if not rep: raise RuntimeError(err.lstrip(ERR))
+            test_text = bench_table(rep)
+            rp = remote_result.get("panel") or {}
+            WIZ["result"] = {"panel_url": panel_url(st), "user": st["panel"]["user"],
+                              "ports": [x["port"] for x in ports],
+                              "other_panel": {"panel_url": rp.get("url", ""), "user": rp.get("user", ""), "pw": rp.get("password") or "(already configured)"},
+                              "test": test_text, "test_lines": rep["rec"].get("lines", [])}
+        else:
+            WIZ["log"].append("Creating foreign (exit) side on this server...")
+            me = local_ip
+            if existing:
+                st = existing
+                all_msg = op_all_models(st)
+                if all_msg.startswith(ERR): raise RuntimeError(all_msg.lstrip(ERR))
+                upd = op_update_tunnel(st, foreign_ip=me, iran_ip=remote["ip"], sni=st.get("sni", "") or sni)
+                if upd.startswith(ERR): raise RuntimeError(upd.lstrip(ERR))
+                save(st)
+                if not apply(st): raise RuntimeError("Could not apply the updated foreign configuration")
+            else:
+                st, _ = core_foreign(me, remote["ip"], domain, sni, list(CATALOG), list(CARRIERS), True, secure, reuse_panel=True)
+            start_bench(st)
+            WIZ["log"].append("Creating Iran (entry) side on destination...")
+            remote_result = agent_issue(sid, "setup_iran", {"token": make_token(st), "ports": ports, "domain": ""})
+            WIZ["log"].append("Running full test on destination Iran server...")
+            test_result = agent_issue(sid, "test", {"full": True, "secs": 4}, timeout=1200)
+            rp = remote_result.get("panel") or {}
+            WIZ["result"] = {"panel_url": panel_url(st), "user": st["panel"]["user"],
+                              "ports": [x["port"] for x in ports],
+                              "other_panel": {"panel_url": rp.get("url", ""), "user": rp.get("user", ""), "pw": rp.get("password") or "(already configured)"},
+                              "test": test_result.get("table", "Test finished"),
+                              "test_lines": test_result.get("lines", []),
+                              "test_results": test_result.get("results", []), "remote_server_id": sid}
+        WIZ["notice"] = "Both sides are configured. Open the Test tab to review results and select the primary tunnel."
+    except Exception as e:
+        WIZ["error"] = f"Managed setup failed: {e}"
+    finally:
+        WIZ["running"] = False
+
+
+def server_select_tunnel(f):
+    sid, name = f.get("id", ""), f.get("name", "")
+    if not sid or not name:
+        return ERR + "Choose a tunnel candidate."
+    try:
+        result = agent_issue(sid, "select_tunnel", {"name": name, "only": f.get("only") == "1"}, timeout=180)
+        return result.get("message", "Tunnel selection applied on the Iran server.")
+    except Exception as e:
+        return ERR + f"Could not apply the selected tunnel: {e}"
+
+
+def server_tunnel_start(f):
+    if WIZ.get("running"):
+        return ERR + "Another setup is already running."
+    role = f.get("local_role")
+    if role not in ("iran", "foreign"):
+        return ERR + "Choose this panel server role."
+    sid = f.get("server_id", "")
+    try:
+        ports = parse_ports(f.get("ports", "443"), f.get("udp", ""))
+        if not ports: return ERR + "Enter at least one valid forwarding port."
+    except Exception:
+        return ERR + "Invalid ports."
+    p = {"server_id": sid, "local_role": role, "ports": f.get("ports", "443"), "udp": f.get("udp", ""),
+         "domain": f.get("domain", "").strip(), "sni": f.get("sni", "www.microsoft.com").strip(),
+         "secure": f.get("mode") != "open"}
+    WIZ.update(running=True, log=["Queued"], error="", notice="", result=None)
+    threading.Thread(target=agent_tunnel_bg, args=(p,), daemon=True).start()
+    return "Managed setup started. This page refreshes automatically."
 
 # ---- page shell
 def tabs_for(st):
     if st["role"] == "new":
-        return [("setup", "Easy setup", "wand"), ("manual", "Manual setup", "tunnel"), ("telegram", "Telegram proxy", "send"),
+        return [("servers", "Servers", "server"), ("manual", "Manual setup", "tunnel"), ("telegram", "Telegram proxy", "send"),
                 ("logs", "Logs", "terminal"), ("system", "System", "settings")]
     t = [("overview", "Overview", "home"), ("transports", "Transports", "layers")]
     t.append(("ports", "Ports", "swap") if st["role"] == "iran" else ("tunnels", "Tunnels", "tunnel"))
-    return t + [("token", "Token", "key"), ("test", "Test", "gauge"), ("telegram", "Telegram proxy", "send"),
+    return [("servers", "Servers", "server")] + t + [("token", "Token", "key"), ("test", "Test", "gauge"), ("telegram", "Telegram proxy", "send"),
                 ("security", "Security", "shield"), ("logs", "Logs", "terminal"), ("system", "System", "settings")]
 
 
@@ -2644,7 +2895,7 @@ def render_page(st, msg=""):
     new = st["role"] == "new"
     states = svc_states()
     pr = {} if new else probe_all(st)
-    secs = {"setup": render_setup, "manual": render_manual, "telegram": lambda: render_tg(st), "logs": render_logs,
+    secs = {"servers": render_servers, "manual": render_manual, "telegram": lambda: render_tg(st), "logs": render_logs,
             "system": lambda: render_system(st)}
     if not new:
         secs.update({"overview": lambda: render_overview(st, states, pr), "transports": lambda: render_transports(st, pr),
@@ -2690,19 +2941,6 @@ def load_any():
         with open(BOOT) as f:
             b = json.load(f)
         return {"role": "new", "panel": b["panel"], "transports": [], "ports": [], "l3": {}}
-
-
-def wiz_bg(p):
-    WIZ.update(running=True, log=[], result=None, error="")
-    try:
-        res, err = easy_setup(p, lambda m: WIZ["log"].append(m))
-        WIZ["result"], WIZ["error"] = res, err.lstrip(ERR) if err else ""
-        if res:
-            start_bench(load())
-    except Exception as e:  # keep the panel alive whatever happens
-        WIZ["error"] = f"Setup failed: {e}"
-    finally:
-        WIZ["running"] = False
 
 
 def tg_act(a, f):
@@ -2814,6 +3052,59 @@ class Handler(BaseHTTPRequestHandler):
         return {k: v[0] for k, v in parse_qs(self.rfile.read(n).decode()).items()}
 
     def do_GET(self):
+        if self.path.startswith("/nt-agent/bootstrap"):
+            q = parse_qs(urlparse(self.path).query)
+            sid, token = q.get("id", [""])[0], q.get("token", [""])[0]
+            rows = peers_load(); row = next((x for x in rows if x.get("id") == sid), None)
+            if (not row or row.get("bootstrap_used") or time.time() > row.get("bootstrap_expires", 0)
+                    or not hmac.compare_digest(row.get("token_hash", ""), hashlib.sha256(token.encode()).hexdigest())):
+                return self.reply(403, "Invalid or expired enrollment token", "text/plain")
+            agent_path = os.path.join(OPT, "agent.py")
+            if not os.path.isfile(agent_path):
+                return self.reply(500, "Agent package missing", "text/plain")
+            host = row["master"]; port = row["port"]; panel_path = row["path"]
+            agent_url = f"https://{host}:{port}/nt-agent/agent.py"
+            cert_fp = hashlib.sha256(open(CERT, "rb").read()).hexdigest() if os.path.isfile(CERT) else ""
+            # Fingerprint is calculated from the DER certificate, not PEM bytes.
+            if os.path.isfile(CERT):
+                pem = open(CERT, "rb").read()
+                der = ssl.PEM_cert_to_DER_cert(pem.decode())
+                cert_fp = hashlib.sha256(der).hexdigest()
+            try:
+                current_state = load_any()
+                le_domain = current_state.get("le", "")
+            except Exception:
+                le_domain = ""
+            tls_mode = "system" if le_domain and host.lower() == le_domain.lower() else "pin"
+            cfg = json.dumps({"master": f"https://{host}:{port}", "id": sid, "token": token,
+                              "panel_path": panel_path, "cert_sha256": cert_fp, "tls_mode": tls_mode})
+            nt_url = f"https://{host}:{port}/nt-agent/nt.py"
+            script = "#!/bin/bash\nset -e\n[ \"$(id -u)\" -eq 0 ] || { echo 'Run as root'; exit 1; }\n"
+            script += "export DEBIAN_FRONTEND=noninteractive\napt-get update -y\napt-get install -y python3 curl jq openssl iproute2 iptables wireguard-tools iputils-ping ca-certificates\n"
+            script += "mkdir -p /opt/night-tunnel /etc/night-tunnel-agent\n"
+            script += f"curl -kfsS '{agent_url}' -o /opt/night-tunnel/agent.py\n"
+            script += f"curl -kfsS '{nt_url}' -o /opt/night-tunnel/nt.py\n"
+            script += "chmod 700 /opt/night-tunnel/nt.py /opt/night-tunnel/agent.py\n"
+            try:
+                repo_raw = open(OPT + "/repo").read().strip()
+            except OSError:
+                repo_raw = "https://raw.githubusercontent.com/Night-net83/night-tunnel/main"
+            script += f"printf '%s\\n' {shlex.quote(repo_raw)} > /opt/night-tunnel/repo\nchmod 600 /opt/night-tunnel/repo\n"
+            script += "python3 /opt/night-tunnel/nt.py install-units\npython3 /opt/night-tunnel/nt.py install-engine\n"
+            script += "cat > /etc/night-tunnel-agent/config.json <<'NTCFG'\n" + cfg + "\nNTCFG\nchmod 600 /etc/night-tunnel-agent/config.json\n"
+            script += "cat > /etc/systemd/system/night-tunnel-agent.service <<'NTUNIT'\n[Unit]\nDescription=Night Tunnel remote agent\nAfter=network-online.target\nWants=network-online.target\n[Service]\nExecStart=/usr/bin/python3 /opt/night-tunnel/agent.py\nRestart=always\nRestartSec=5\nUser=root\n[Install]\nWantedBy=multi-user.target\nNTUNIT\nsystemctl daemon-reload\nsystemctl enable --now night-tunnel-agent\necho 'Night Tunnel Agent installed.'\n"
+            row["bootstrap_used"] = True
+            row["command"] = "(already used)"
+            peers_save(rows)
+            return self.reply(200, script, "text/x-shellscript; charset=utf-8")
+        if self.path in ("/nt-agent/agent.py", "/nt-agent/nt.py"):
+            filename = "agent.py" if self.path.endswith("agent.py") else "nt.py"
+            source_path = os.path.join(OPT, filename)
+            if os.path.isfile(source_path):
+                return self.reply(200, open(source_path).read(), "text/plain; charset=utf-8")
+            return self.reply(404, "Agent package missing", "text/plain")
+        if self.path.startswith("/nt-agent/poll"):
+            return self.agent_poll()
         st = load_any()
         s = self.sub(st)
         if s is None:
@@ -2831,7 +3122,45 @@ class Handler(BaseHTTPRequestHandler):
             return self.reply(200, render_page(st, self.flash.pop(self.tok(), "")))
         self.reply(200, login_page())
 
+    def _agent_row(self):
+        sid = self.headers.get("X-NT-Agent", "")
+        token = self.headers.get("X-NT-Token", "")
+        rows = peers_load(); row = next((x for x in rows if x.get("id") == sid), None)
+        if not row or not hmac.compare_digest(row.get("token_hash", ""), hashlib.sha256(token.encode()).hexdigest()):
+            return None, rows
+        return row, rows
+
+    def agent_poll(self):
+        row, rows = self._agent_row()
+        if not row:
+            return self.reply(403, "{}", "application/json")
+        row["last_seen"] = time.time(); peers_save(rows)
+        cmd = row.get("pending")
+        return self.reply(200, json.dumps({"ok": True, "command": cmd}, separators=(",", ":")), "application/json")
+
+    def agent_result(self):
+        row, rows = self._agent_row()
+        if not row:
+            return self.reply(403, "{}", "application/json")
+        try:
+            n = min(int(self.headers.get("Content-Length") or 0), 262144)
+            data = json.loads(self.rfile.read(n).decode("utf-8"))
+            pending = row.get("pending") or {}
+            if not data.get("id") or data.get("id") != pending.get("id"):
+                return self.reply(409, '{"ok":false,"error":"stale command"}', "application/json")
+            row["last_result"] = {"id": data["id"], "ok": bool(data.get("ok")),
+                                  "data": data.get("data") if isinstance(data.get("data"), dict) else {},
+                                  "error": str(data.get("error", ""))[:1000]}
+            row["pending"] = None
+            row["last_seen"] = time.time()
+            peers_save(rows)
+            return self.reply(200, '{"ok":true}', "application/json")
+        except Exception:
+            return self.reply(400, '{"ok":false,"error":"bad payload"}', "application/json")
+
     def do_POST(self):
+        if self.path == "/nt-agent/result":
+            return self.agent_result()
         st = load_any()
         s = self.sub(st)
         if s is None:
@@ -2872,19 +3201,16 @@ class Handler(BaseHTTPRequestHandler):
     def act_new(self, f):
         """Actions while no tunnel exists yet (panel started first)."""
         a = f.get("a")
-        if a == "wizard":
-            if WIZ["running"]:
-                return ERR + "Setup is already running."
-            p = {"local_role": f.get("role"), "remote_ip": f.get("remote_ip", "").strip(),
-                 "ssh_port": f.get("ssh_port", "22"), "ssh_user": f.get("ssh_user", "root").strip(),
-                 "ssh_pass": f.get("ssh_pass", ""), "ssh_key": f.get("ssh_key", "").strip(),
-                 "secure": f.get("mode") != "open", "force": "force" in f,
-                 "ports": parse_ports(f.get("ports", ""), f.get("udp", ""))}
-            if f.get("local_ip", "").strip():
-                p["local_ip"] = f["local_ip"].strip()
-            threading.Thread(target=wiz_bg, args=(p,), daemon=True).start()
-            WIZ.update(running=True, log=["starting"], error="")
-            return "Setup started. This page refreshes by itself."
+        if a == "server_add":
+            return server_add(f, load_any()["panel"])
+        if a == "server_tunnel":
+            return server_tunnel_start(f)
+        if a == "server_regenerate":
+            return server_regenerate(f, load_any()["panel"])
+        if a == "server_select_tunnel":
+            return server_select_tunnel(f)
+        if a == "server_remove":
+            rows = peers_load(); rows = [x for x in rows if x.get("id") != f.get("id")]; peers_save(rows); return "Server removed."
         if a == "wizclear":
             WIZ["result"] = None
             WIZ["notice"] = ""
@@ -2897,6 +3223,12 @@ class Handler(BaseHTTPRequestHandler):
         a = f.get("a")
         if st["role"] == "new":
             return self.act_new(f)
+        if a in ("server_add", "server_remove", "server_tunnel", "server_select_tunnel", "server_regenerate"):
+            if a == "server_add": return server_add(f, st["panel"])
+            if a == "server_tunnel": return server_tunnel_start(f)
+            if a == "server_select_tunnel": return server_select_tunnel(f)
+            if a == "server_regenerate": return server_regenerate(f, st["panel"])
+            rows = peers_load(); peers_save([x for x in rows if x.get("id") != f.get("id")]); return "Server removed."
         if a in ("tgcreate", "tgedit", "tgrestart", "tgrotate", "tgremove", "wizclear", "chpw", "bbr",
                  "checkver", "update_script", "update_gost"):
             return sys_act(st, a, f)
@@ -3409,71 +3741,8 @@ def setup_iran():
     say("Tunnel is up. Each forwarded port P goes to 127.0.0.1:P on the foreign server.", G)
 
 
-# ------------------------------------------- easy mode: install the OTHER server over SSH
-# The beginner gives the other server's IP + SSH login; this server pushes itself there, installs the
-# dependencies and the engine, creates the matching side of the tunnel and wires both ends together.
-# The SSH password lives only in memory for the duration of the setup; nothing is written to disk.
-SSH_USER_RE = re.compile(r"^[a-z_][a-z0-9_-]{0,31}$")
+# Managed setup state shared by the Servers tab and background worker.
 WIZ = {"running": False, "log": [], "result": None, "error": "", "notice": ""}
-
-
-class Remote:
-    def __init__(self, host, port=22, user="root", password="", key=""):
-        self.host, self.port, self.user, self.password, self.key = host, int(port), user, password, key
-
-    def _opts(self):
-        o = ["-o", "StrictHostKeyChecking=accept-new", "-o", "ConnectTimeout=12",
-             "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=8", "-o", "LogLevel=ERROR"]
-        if self.key:
-            o += ["-i", self.key, "-o", "IdentitiesOnly=yes", "-o", "BatchMode=yes"]
-        elif self.password:
-            o += ["-o", "PreferredAuthentications=password,keyboard-interactive", "-o", "PubkeyAuthentication=no"]
-        else:
-            o += ["-o", "BatchMode=yes"]
-        return o
-
-    def _go(self, argv, inp=None, timeout=900):
-        env = dict(os.environ)
-        if self.password and not self.key:
-            env["SSHPASS"] = self.password          # never on the command line
-            argv = ["sshpass", "-e"] + argv
-        try:
-            r = subprocess.run(argv, input=inp, capture_output=True, text=True, timeout=timeout, env=env)
-        except subprocess.TimeoutExpired:
-            return 255, "", "timed out"
-        except FileNotFoundError as e:
-            return 127, "", str(e)
-        return r.returncode, r.stdout, r.stderr
-
-    def run(self, cmd, inp=None, timeout=900):
-        return self._go(["ssh", "-p", str(self.port)] + self._opts() + [f"{self.user}@{self.host}", cmd],
-                        inp, timeout)
-
-    def put(self, src, dst):
-        return self._go(["scp", "-P", str(self.port)] + self._opts() + [src, f"{self.user}@{self.host}:{dst}"],
-                        None, 300)
-
-
-def ssh_explain(rc, err):
-    e = (err or "").strip()
-    if rc == 127:
-        return "ssh / sshpass is not installed on this server."
-    if "Permission denied" in e:
-        return ("SSH login refused: wrong password/key, or the other server does not allow root password "
-                "login (PermitRootLogin / PasswordAuthentication).")
-    if "Host key verification failed" in e:
-        return "The other server's SSH host key changed. Remove its line from ~/.ssh/known_hosts and retry."
-    if any(x in e for x in ("timed out", "No route", "refused", "unreachable")):
-        return "Cannot reach the other server over SSH (check IP, SSH port and its firewall)."
-    return "SSH failed: " + (e[-300:] or "unknown error")
-
-
-def ensure_ssh_tools(need_pass):
-    want = ["ssh", "scp"] + (["sshpass"] if need_pass else [])
-    if all(shutil.which(x) for x in want):
-        return True
-    sh("DEBIAN_FRONTEND=noninteractive apt-get install -y openssh-client sshpass")
-    return all(shutil.which(x) for x in want)
 
 
 def install_gost():
@@ -3507,213 +3776,12 @@ def install_gost():
         shutil.rmtree(d, ignore_errors=True)
 
 
-def remote_prepare(r, log, force=False):
-    """Check the other server and install night-tunnel + dependencies + engine on it. Returns an error or ''."""
-    log(f"Connecting to {r.host} over SSH ...")
-    rc, out, err = r.run("id -u; uname -m; command -v apt-get >/dev/null && echo APT; "
-                         "command -v gost >/dev/null && echo GOST; "
-                         "[ -f /etc/night-tunnel/state.json ] && echo EXISTS; echo END")
-    if rc != 0 or "END" not in out:
-        return ERR + ssh_explain(rc, err)
-    lines = out.split()
-    if not lines or lines[0] != "0":
-        return ERR + "The SSH user on the other server must be root."
-    if "APT" not in lines:
-        return ERR + "The other server must be Debian/Ubuntu."
-    if "EXISTS" in lines and not force:
-        return ERR + ("The other server already has a night-tunnel configuration. "
-                      "Tick 'overwrite' to replace it, or remove it there first.")
-    arch = lines[1] if len(lines) > 1 else ""
-    log("Installing packages on the other server (1-2 minutes) ...")
-    rc, out, err = r.run("export DEBIAN_FRONTEND=noninteractive; apt-get update -y >/dev/null 2>&1; "
-                         "apt-get install -y python3 curl jq openssl iproute2 iptables wireguard-tools "
-                         "iputils-ping ca-certificates >/dev/null 2>&1 && mkdir -p /opt/night-tunnel /etc/night-tunnel")
-    if rc != 0:
-        return ERR + "Package installation failed on the other server (apt mirrors / internet?). " + err[-200:]
-    log("Copying night-tunnel ...")
-    rc, _, err = r.put(os.path.abspath(__file__), "/opt/night-tunnel/nt.py")
-    if rc != 0:
-        return ERR + "Copy failed: " + ssh_explain(rc, err)
-    try:
-        with open(OPT + "/repo") as f:
-            repo = f.read().strip()
-    except OSError:
-        repo = ""
-    rc, _, err = r.run("chmod 700 /opt/night-tunnel/nt.py && cat > /usr/local/bin/night-tunnel && "
-                       "chmod +x /usr/local/bin/night-tunnel" + (f" && echo {shlex.quote(repo)} > /opt/night-tunnel/repo" if repo else ""),
-                       inp='#!/bin/sh\nexec python3 /opt/night-tunnel/nt.py "$@"\n')
-    if rc != 0:
-        return ERR + "Could not install the launcher: " + err[-200:]
-    if "GOST" not in lines:
-        local_gost = shutil.which("gost")
-        if local_gost and os.uname().machine == arch:
-            log("Copying the engine (gost) from this server ...")
-            rc, _, err = r.put(local_gost, "/usr/local/bin/gost")
-            if rc == 0:
-                r.run("chmod 755 /usr/local/bin/gost")
-        else:
-            log("Downloading the engine (gost) on the other server ...")
-            rc, out, err = r.run("python3 /opt/night-tunnel/nt.py install-engine")
-            if rc != 0:
-                return ERR + "Engine install failed on the other server: " + (out + err)[-250:]
-    rc, _, err = r.run("python3 /opt/night-tunnel/nt.py install-units")
-    if rc != 0:
-        return ERR + "Could not create the services on the other server: " + err[-200:]
-    if "EXISTS" in lines and force:
-        r.run("python3 /opt/night-tunnel/nt.py reset-yes")
-    return ""
-
-
-def remote_configure(r, kind, params, log):
-    """Run the non-interactive setup of one side on the other server; returns (result dict, error)."""
-    log("Creating the tunnel on the other server ...")
-    rc, out, err = r.run(f"python3 /opt/night-tunnel/nt.py auto-{kind}", inp=json.dumps(params), timeout=600)
-    line = next((x for x in out.splitlines() if x.startswith("NT_RESULT:")), "")
-    if rc != 0 or not line:
-        return None, ERR + "Setup failed on the other server: " + (err or out)[-300:]
-    try:
-        return json.loads(base64.b64decode(line[10:])), ""
-    except ValueError:
-        return None, ERR + "Unreadable answer from the other server."
-
-
-def auto_cmd(kind):
-    """Non-interactive setup of one side (called over SSH by the other server): params on stdin."""
-    need_root()
-    try:
-        p = json.loads(sys.stdin.read())
-        if kind == "foreign":
-            assert valid_ip(p["me"]) and valid_ip(p["iran_ip"])
-            st, pw = core_foreign(p["me"], p["iran_ip"], "", p.get("sni") or "www.microsoft.com",
-                                  list(CATALOG), ["wg"], False, bool(p.get("secure", True)))
-            out = {"token": make_token(st)}
-        else:
-            d = parse_token(p["token"])
-            ports = [{"port": int(x["port"]), "proto": x["proto"] if x["proto"] in ("tcp", "udp", "both") else "tcp"}
-                     for x in p["ports"]]
-            assert ports
-            st, pw = core_iran(d, "", ports)
-            out = {}
-        out.update(panel_url=panel_url(st), user=st["panel"]["user"], pw=pw)
-    except Exception as e:
-        print("auto setup error:", e, file=sys.stderr)
-        sys.exit(1)
-    print("NT_RESULT:" + base64.b64encode(json.dumps(out).encode()).decode())
-
-
-_BENCH_THREAD = []
-
-
 def start_bench(st):
     """The foreign panel process answers the tunnel tester; start it once (also right after a panel-driven setup)."""
     if st["role"] == "foreign" and not _BENCH_THREAD:
         t = threading.Thread(target=bench_serve, args=(st,), daemon=True)
         t.start()
         _BENCH_THREAD.append(t)
-
-
-def easy_setup(p, log):
-    """Build the whole tunnel from THIS server: also installs and configures the other server over SSH.
-    p: local_role (iran|foreign), remote_ip, ssh_port, ssh_user, ssh_pass | ssh_key, secure, ports (list),
-       local_ip (optional), force (overwrite the other server's old config).
-    Returns (result dict, error)."""
-    role = p.get("local_role")
-    if role not in ("iran", "foreign"):
-        return None, ERR + "Choose whether this server is the Iran or the foreign server."
-    if not valid_ip(p.get("remote_ip", "")):
-        return None, ERR + "Enter the other server's IPv4 address."
-    try:
-        port = int(p.get("ssh_port") or 22)
-        assert 1 <= port <= 65535
-    except (ValueError, AssertionError):
-        return None, ERR + "Invalid SSH port."
-    user = p.get("ssh_user") or "root"
-    if not SSH_USER_RE.match(user):
-        return None, ERR + "Invalid SSH user."
-    key = p.get("ssh_key") or ""
-    if key and not os.path.isfile(key):
-        return None, ERR + "SSH key file not found on this server."
-    if not key and not p.get("ssh_pass"):
-        return None, ERR + "Give the other server's SSH password (or a key file)."
-    ports = p.get("ports") or []
-    if not ports:
-        return None, ERR + "Enter at least one port to forward (e.g. 443)."
-    if os.path.exists(STATE):
-        return None, ERR + "This server already has a tunnel configured. Remove it first (menu 11), then retry."
-    me = p.get("local_ip") or public_ip()
-    if not valid_ip(me):
-        return None, ERR + "Could not detect this server's public IP; enter it."
-    if me == p["remote_ip"]:
-        return None, ERR + "The other server's IP is this server's own IP."
-    secure = bool(p.get("secure", True))
-    if not ensure_ssh_tools(not key):
-        return None, ERR + "Could not install ssh / sshpass on this server."
-    r = Remote(p["remote_ip"], port, user, "" if key else p["ssh_pass"], key)
-    err = remote_prepare(r, log, bool(p.get("force")))
-    if err:
-        return None, err
-    result = {"role": role, "other_ip": p["remote_ip"], "secure": secure, "ports": [x["port"] for x in ports]}
-    if role == "iran":
-        res, err = remote_configure(r, "foreign", {"me": p["remote_ip"], "iran_ip": me, "secure": secure}, log)
-        if err:
-            return None, err
-        log("Creating this (Iran) server's side ...")
-        st, _ = core_iran(parse_token(res["token"]), "", ports, reuse_panel=True)
-        result["other_panel"] = {k: res.get(k) for k in ("panel_url", "user", "pw")}
-        log("Waiting a few seconds, then running a quick connection test ...")
-        time.sleep(6)
-        try:
-            rep, terr = run_bench(st, full=False, log=log)
-            result["test"] = bench_table(rep) if rep else terr.lstrip(ERR)
-            result["test_lines"] = rep["rec"]["lines"] if rep else []
-        except Exception as e:  # the tunnel is up either way; the test is a bonus
-            result["test"] = f"Test could not run: {e}"
-    else:
-        log("Creating this (foreign) server's side ...")
-        st, _ = core_foreign(me, p["remote_ip"], "", "www.microsoft.com", list(CATALOG), ["wg"], False,
-                             secure, reuse_panel=True)
-        start_bench(st)
-        res, err = remote_configure(r, "iran", {"token": make_token(st), "ports": ports}, log)
-        if err:
-            return None, err + " (This server's side is already created; remove it with menu 11 to retry.)"
-        result["other_panel"] = {k: res.get(k) for k in ("panel_url", "user", "pw")}
-        result["test"] = "Run the connection test on the Iran server (menu 13 or its panel)."
-    result["panel_url"] = panel_url(st)
-    result["user"] = st["panel"]["user"]
-    return result, ""
-
-
-def easy_menu():
-    need_root()
-    say("== Easy setup: build the whole tunnel from this server ==", G)
-    print("This server connects to the OTHER server over SSH, installs night-tunnel there and creates\n"
-          "both sides of the tunnel automatically. You only need the other server's IP and its root login.")
-    role = "iran" if ask("This server is the  1) Iran (entry) server   2) foreign (exit) server", "1") != "2" else "foreign"
-    p = {"local_role": role, "remote_ip": ask("IP of the OTHER server (" + ("foreign" if role == "iran" else "Iran") + ")")}
-    p["ssh_port"] = ask("SSH port of the other server", "22")
-    p["ssh_user"] = ask("SSH user (must be root)", "root")
-    p["ssh_key"] = ask("SSH private key file (empty = use a password)")
-    if not p["ssh_key"]:
-        p["ssh_pass"] = getpass.getpass("SSH password of the other server (hidden): ")
-    p["secure"] = pick_security()
-    p["ports"] = parse_ports(ask("Ports to forward on the Iran server, e.g. 443,2053"),
-                             ask("Ports that also need UDP (optional)"))
-    if not (public_ip() or "").strip():
-        p["local_ip"] = ask("This server's public IP")
-    if ask("Overwrite an existing night-tunnel config on the other server if it has one? (y/n)", "n") == "y":
-        p["force"] = True
-    res, err = easy_setup(p, lambda m: print("  " + m))
-    if err:
-        return say(err.lstrip(ERR), R)
-    say("\n=== Tunnel is up ===", G)
-    print(f"Forwarded ports (Iran -> foreign 127.0.0.1:P): {', '.join(map(str, res['ports']))}")
-    print(f"This server's panel : {res['panel_url']}  (user {res['user']}; password as when it was created)")
-    o = res["other_panel"]
-    print(f"Other server's panel: {o['panel_url']}\n  user {o['user']}  password {o['pw']}  (save it now)")
-    if res.get("test"):
-        print("\n" + res["test"])
-        for ln in res.get("test_lines", []):
-            print(" - " + ln)
 
 
 def _write_boot(boot):
@@ -3769,8 +3837,8 @@ def panel_init():
     sh("systemctl enable night-tunnel-panel")
     sh("systemctl restart night-tunnel-panel")
     panel_report({"panel": p}, pw)
-    say("In the panel: 'Easy setup' builds the tunnel and installs the other server for you; "
-        "'Telegram proxy' makes a proxy on this server.", G)
+    say("In the panel: register the destination in Servers, run its one-time Agent bootstrap command, "
+        "then build and test both tunnel sides from the browser. Telegram proxy is also available.", G)
 
 
 def show_panel(st, pw=None):
@@ -3802,7 +3870,7 @@ def need_state():
     try:
         return load()
     except (OSError, ValueError):
-        say("Not configured yet: create the web panel (16) or run the easy setup (15).", R)
+        say("Not configured yet: create the web panel (15), then register the destination in Servers.", R)
         return None
 
 
@@ -4074,10 +4142,9 @@ def menu():
               "\n9) Panel info / reset panel password\n10) Update (script / engine)\n11) Remove (delete tunnel / uninstall all)"
               "\n12) Enable BBR\n13) TEST tunnels (connect + speed + recommendation)"
               "\n14) Update tunnel settings (IPs / SNI / rotate keys)"
-              "\n15) EASY SETUP: build the tunnel + auto-install the other server over SSH"
-              "\n16) WEB PANEL: create it / show its URL + new password (set up everything from the browser)"
-              "\n17) Telegram proxy (separate from the tunnels)"
-              "\n18) Security mode (with / without password)\n0) Exit")
+              "\n15) WEB PANEL: create it / show its URL + new password (manage servers from the browser)"
+              "\n16) Telegram proxy (separate from the tunnels)"
+              "\n17) Security mode (with / without password)\n0) Exit")
         c = input("Choose: ").strip()
         try:
             if c == "1":
@@ -4110,17 +4177,15 @@ def menu():
             elif c == "14":
                 update_tunnel_menu()
             elif c == "15":
-                easy_menu()
-            elif c == "16":
                 panel_init()
-            elif c == "17":
+            elif c == "16":
                 tg_menu()
-            elif c == "18":
+            elif c == "17":
                 security_menu()
             elif c == "0":
                 return
         except FileNotFoundError:
-            say("Not configured yet: create the web panel (16) or run the easy setup (15).", R)
+            say("Not configured yet: create the web panel (15), then register the destination in Servers.", R)
 
 
 def engine_cmd():
@@ -4138,9 +4203,8 @@ def main():
         return teardown(full=True, purge="--purge" in sys.argv)
     {"menu": menu, "panel": run_panel, "l3-up": l3_up, "l3-down": l3_down,
      "status": status, "apply": apply, "test": test_menu, "setup-foreign": setup_foreign,
-     "setup-iran": setup_iran, "easy": easy_menu, "panel-init": panel_init, "tg": tg_menu,
-     "install-units": write_units, "install-engine": engine_cmd,
-     "auto-foreign": lambda: auto_cmd("foreign"), "auto-iran": lambda: auto_cmd("iran")}.get(a, menu)()
+     "setup-iran": setup_iran, "panel-init": panel_init, "tg": tg_menu,
+     "install-units": write_units, "install-engine": engine_cmd}.get(a, menu)()
 
 
 if __name__ == "__main__":
