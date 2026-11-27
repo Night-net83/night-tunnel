@@ -176,3 +176,8 @@ MIT License
 
 ## v1.8.3
 - **Update from the Iran panel updates the foreign servers too.** "Update night-tunnel" first tells every registered server (joined by the join command) to update itself, then updates the Iran panel. The result lists each server. Servers older than 1.8.3 have no remote update: update them once by hand, after that it is automatic.
+
+## v1.8.4
+- **Updating the foreign servers no longer needs GitHub on them.** The Iran panel sends its own script over the control channel (`Update night-tunnel` updates the servers first, then itself; `Update servers from this panel` pushes only). Works even when a server cannot reach GitHub.
+- Download errors now show the URL and the real reason (e.g. 404 = nt.py is not in the repo).
+- Servers older than 1.8.4 must be updated once by hand (copy `nt.py` to them, restart `night-tunnel-panel`); after that it is automatic.

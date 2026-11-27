@@ -34,7 +34,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlencode, urlparse
 
 NAME = "night-tunnel"
-VERSION = "1.8.3"
+VERSION = "1.8.4"
 BASE = os.environ.get("NT_BASE", "/etc/night-tunnel")
 STATE = BASE + "/state.json"
 GOST_CFG = BASE + "/gost.json"
@@ -1747,26 +1747,50 @@ def remote_version():
     return m.group(1) if m else None
 
 
-def update_script():
+def fetch_script():
+    """Download the latest nt.py from the repo. Returns (source, error)."""
     try:
         raw = open(OPT + "/repo").read().strip()
     except OSError:
-        return ERR + "Repo URL unknown; reinstall with the one-line command."
-    tmp = OPT + "/nt.py.new"
-    if sh(f"curl -fsSL --max-time 30 {shlex.quote(raw + '/nt.py')} -o {tmp}").returncode != 0:
-        return ERR + "Download failed."
+        return None, "Repo URL unknown; reinstall with the one-line command."
+    url = raw + "/nt.py"
+    r = sh(f"curl -fsS --max-time 30 {shlex.quote(url)}")
+    if r.returncode != 0:
+        why = (r.stderr or "").strip().splitlines()[-1:] or ["no answer"]
+        return None, f"Download failed from {url} ({why[0][:120]}). Check that nt.py is in the repo and the server can reach GitHub."
+    return r.stdout, None
+
+
+def check_script(src):
+    """Validate a nt.py source. Returns (version, error)."""
     try:
-        src = open(tmp).read()
         ast.parse(src)
         assert 'NAME = "night-tunnel"' in src
+        m = re.search(r'^VERSION = "([^"]+)"', src, re.M)
+        assert m
     except Exception:
-        os.remove(tmp)
-        return ERR + "Downloaded file is invalid; kept the current version."
-    m = re.search(r'^VERSION = "([^"]+)"', src, re.M)
+        return None, "The script file is invalid; kept the current version."
+    return m.group(1), None
+
+
+def install_script(src):
+    ver, err = check_script(src)
+    if err:
+        return ERR + err
+    tmp = OPT + "/nt.py.new"
+    with open(tmp, "w") as f:
+        f.write(src)
     os.replace(tmp, OPT + "/nt.py")
     os.chmod(OPT + "/nt.py", 0o700)
     sh("systemd-run --no-block --collect sh -c 'sleep 2; systemctl restart night-tunnel-panel'")
-    return f"Script updated {VERSION} -> {m.group(1) if m else '?'}. Panel restarts in a moment."
+    return f"Script updated {VERSION} -> {ver}. Panel restarts in a moment."
+
+
+def update_script():
+    src, err = fetch_script()
+    if err:
+        return ERR + err
+    return install_script(src)
 
 
 def update_gost():
@@ -2223,6 +2247,8 @@ FA_TEXT.update({
 FA_TEXT.update({
     # sponsor channel
     "Sponsor channel": "کانال اسپانسر",
+    "Update servers from this panel": "به‌روزرسانی سرورها از این پنل",
+    "Send this panel's version to every registered server?": "نسخهٔ این پنل برای همهٔ سرورهای ثبت‌شده فرستاده شود؟",
     "Check status": "بررسی وضعیت", "Create proxy on this server": "ساخت پروکسی روی این سرور",
     "It is built ON that server (not on this panel). The first run downloads the engine there, so it can take a minute.": "پروکسی روی همان سرور ساخته می‌شود (نه روی این پنل). بار اول موتور آنجا دانلود می‌شود و ممکن است یک دقیقه طول بکشد.",
     "Running on the foreign server. Share the link with the people who need it.": "روی سرور خارج اجرا می‌شود. لینک را به کسانی که لازم دارند بدهید.",
@@ -2836,6 +2862,8 @@ def render_system(st):
               "At least 8 characters. The panel login user stays the same.")
     m = ("<div class=row>" + form({"a": "checkver"}, "<button class='btn g'>Check for update</button>")
          + form({"a": "update_script"}, "<button class='btn g'>Update night-tunnel</button>", confirm="Update the script?")
+         + ("" if st["role"] == "foreign" else form({"a": "push_servers"}, "<button class='btn g'>Update servers from this panel</button>",
+                                                    confirm="Send this panel's version to every registered server?"))
          + form({"a": "update_gost"}, "<button class='btn g'>Update engine (gost)</button>", confirm="Update gost?")
          + ("" if new else form({"a": "restart"}, "<button class='btn g'>Restart tunnel</button>")) + "</div>")
     o += card("Maintenance", m, f"<span>Installed version</span> <span class=mono>v{VERSION}</span>")
@@ -3885,12 +3913,18 @@ def sys_act(st, a, f):
     if a == "checkver":
         rv = remote_version()
         return f"Installed v{VERSION}, latest v{rv}." if rv else ERR + "Could not check (no repo URL / no access)."
+    if a == "push_servers":
+        return update_servers() or ERR + "No registered server to update."
     if a == "update_script":
-        srv = update_servers() if st.get("role") != "foreign" else ""
-        me = update_script()
-        if not srv:
-            return me
-        return (ERR if me.startswith(ERR) else "") + srv + " | " + me.lstrip(ERR)
+        if st.get("role") == "foreign":
+            return update_script()
+        src, err = fetch_script()
+        if err:   # GitHub not reachable from here: still push what this panel runs to the servers
+            srv = update_servers()
+            return ERR + err + (" | " + srv if srv else "")
+        srv = update_servers(src)          # servers first, while this panel is still up
+        me = install_script(src)
+        return (ERR if me.startswith(ERR) else "") + (srv + " | " if srv else "") + me.lstrip(ERR)
     if a == "update_gost":
         return update_gost()
     return tg_act(a, f)
@@ -3941,7 +3975,8 @@ class Handler(BaseHTTPRequestHandler):
         return bool(self.tok())
 
     def form(self):
-        n = min(int(self.headers.get("Content-Length") or 0), 65536)
+        cap = 600000 if self.path.split("?")[0].endswith("/agent") else 65536   # agent: a compressed script update
+        n = min(int(self.headers.get("Content-Length") or 0), cap)
         return {k: v[0] for k, v in parse_qs(self.rfile.read(n).decode()).items()}
 
     def do_GET(self):
@@ -4042,7 +4077,7 @@ class Handler(BaseHTTPRequestHandler):
                 return ERR + "Tunnels are created and managed from the Iran (entry) panel."
             return nw_act(f) if a.startswith("nw") else tn_act(f)
         if a in ("tgcreate", "tgedit", "tgrestart", "tgrotate", "tgremove", "tgtag", "wizclear", "chpw", "bbr",
-                 "checkver", "update_script", "update_gost"):
+                 "checkver", "update_script", "update_gost", "push_servers"):
             return sys_act(st, a, f)
         if a == "save":
             prio = {}
@@ -5136,6 +5171,16 @@ def agent_serve(st, f, ip):
     elif cmd == "update":
         msg = update_script()
         out = {"ok": not msg.startswith(ERR), "msg": msg.lstrip(ERR), "v": VERSION}
+    elif cmd == "pushupdate":      # the controller (Iran panel) sends the script itself: no GitHub needed here
+        try:
+            import zlib
+            src = zlib.decompressobj().decompress(base64.b64decode(f.get("arg", "")), 4 << 20).decode()
+        except Exception:
+            return 400, '{"err":"bad update data"}'
+        msg = install_script(src)
+        if msg.startswith(ERR):
+            return 400, json.dumps({"err": msg.lstrip(ERR)})
+        out = {"ok": True, "msg": msg, "v": VERSION}
     elif cmd in TG_AGENT_CMDS:
         try:
             a = json.loads(f.get("arg") or "{}")
@@ -5169,21 +5214,33 @@ def agent_serve(st, f, ip):
     return 200, json.dumps(out)
 
 
-def update_servers():
-    """Iran/controller panel: tell every registered server to update itself first (before this panel restarts)."""
+def update_servers(src=None):
+    """Controller panel: push this panel's script to every registered server over the control channel
+    (no GitHub needed on the servers), then they restart themselves."""
     d = srv_load()
     todo = [x for x in d["servers"] if x["status"] != "waiting" and x.get("agent")]
     if not todo:
         return ""
+    if src is None:
+        try:
+            with open(OPT + "/nt.py") as f:
+                src = f.read()
+        except OSError:
+            with open(os.path.abspath(__file__)) as f:
+                src = f.read()
+    import zlib
+    blob = base64.b64encode(zlib.compress(src.encode(), 9)).decode()
 
     def one(x):
         try:
-            r = agent_call(x, "update", timeout=60)
+            r = agent_call(x, "pushupdate", blob, timeout=60)
             return f"{x['name']}: {r.get('msg', 'updated')}"
         except Exception as e:
             m = str(e)
             if "unknown command" in m:
-                m = "runs an old version without remote update; update it once by hand (its panel: System > Update night-tunnel)"
+                m = (f"runs an old version that cannot be updated remotely. Update it ONCE by hand, from this server: "
+                     f"scp /opt/night-tunnel/nt.py root@{x['ip']}:/opt/night-tunnel/nt.py && "
+                     f"ssh root@{x['ip']} systemctl restart night-tunnel-panel")
             return f"{x['name']}: {m}"
     with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
         return "Servers: " + "; ".join(ex.map(one, todo))
