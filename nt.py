@@ -34,7 +34,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlencode, urlparse
 
 NAME = "night-tunnel"
-VERSION = "1.8.1"
+VERSION = "1.8.3"
 BASE = os.environ.get("NT_BASE", "/etc/night-tunnel")
 STATE = BASE + "/state.json"
 GOST_CFG = BASE + "/gost.json"
@@ -2222,7 +2222,23 @@ FA_TEXT.update({
 
 FA_TEXT.update({
     # sponsor channel
-    "Sponsor channel": "کانال اسپانسر", "Sponsor": "اسپانسر", "Active": "فعال", "Not set": "تنظیم نشده",
+    "Sponsor channel": "کانال اسپانسر",
+    "Check status": "بررسی وضعیت", "Create proxy on this server": "ساخت پروکسی روی این سرور",
+    "It is built ON that server (not on this panel). The first run downloads the engine there, so it can take a minute.": "پروکسی روی همان سرور ساخته می‌شود (نه روی این پنل). بار اول موتور آنجا دانلود می‌شود و ممکن است یک دقیقه طول بکشد.",
+    "Running on the foreign server. Share the link with the people who need it.": "روی سرور خارج اجرا می‌شود. لینک را به کسانی که لازم دارند بدهید.",
+    "Use it from inside Iran": "استفاده از داخل ایران", "Also open it on the Iran server": "روی سرور ایران هم باز شود",
+    "Stop sharing through Iran": "قطع اشتراک از ایران", "Port on the Iran server": "پورت روی سرور ایران",
+    "Opens a port on this (Iran) server that forwards through the tunnel to the proxy, so users connect to an Iran IP.": "روی این سرور (ایران) یک پورت باز می‌کند که از طریق تانل به پروکسی می‌رسد؛ کاربران به IP ایران وصل می‌شوند.",
+    "Sponsor channel (@username or ID)": "کانال اسپانسر (@یوزرنیم یا آیدی)", "Tag from @MTProxybot": "تگ از @MTProxybot",
+    "Add the foreign server first (Servers tab). The proxy is then built on that server, from here, by its IP.": "اول سرور خارج را در بخش Servers اضافه کنید. پروکسی با همان IP روی آن سرور و از همین‌جا ساخته می‌شود.",
+    "Open Servers": "باز کردن Servers", "Run a proxy on THIS server instead (advanced)": "ساخت پروکسی روی همین سرور (پیشرفته)",
+    "Choose a server first (Servers tab).": "اول یک سرور انتخاب کنید (بخش Servers).",
+    "Open @MTProxybot in Telegram and send /newproxy.": "در تلگرام @MTProxybot را باز کنید و /newproxy بفرستید.",
+    "Send the address below, then the secret below.": "آدرس و بعد سکرت زیر را برای ربات بفرستید.",
+    "The bot answers with a tag. Paste it here.": "ربات یک تگ می‌دهد. همین‌جا بچسبانید.",
+    "In the bot: /myproxies, choose this proxy, Set promotion, and pick your channel (you must be its admin).": "در ربات: /myproxies، همین پروکسی را انتخاب کنید، Set promotion را بزنید و کانالتان را انتخاب کنید (باید ادمین کانال باشید).",
+    "Telegram only lets the owner of the channel link it to a proxy, through @MTProxybot: no program can do that step for you. The tag it gives is what makes the channel appear on top of Telegram for everyone using this proxy. A new secret, port or cover domain clears the tag.": "تلگرام فقط به صاحب کانال اجازه می‌دهد از طریق @MTProxybot کانال را به پروکسی وصل کند و هیچ برنامه‌ای نمی‌تواند این مرحله را به‌جای شما انجام دهد. تگی که ربات می‌دهد باعث می‌شود کانال بالای تلگرامِ همهٔ کسانی که با این پروکسی وصل‌اند نمایش داده شود. سکرت، پورت یا دامنهٔ جدید تگ را پاک می‌کند.",
+    "Your channel shows on top of Telegram for everyone connected through this proxy.": "کانال شما بالای تلگرامِ همهٔ کسانی که با این پروکسی وصل‌اند نمایش داده می‌شود.", "Sponsor": "اسپانسر", "Active": "فعال", "Not set": "تنظیم نشده",
     "Sponsor tag": "تگ اسپانسر", "Save sponsor": "ذخیره اسپانسر", "Remove sponsor": "حذف اسپانسر",
     "Remove the sponsor from this proxy?": "اسپانسر از این پروکسی حذف شود؟",
     "Show your channel to everyone who uses this proxy (Telegram's sponsored channel line). The tag comes from @MTProxybot.":
@@ -2655,7 +2671,7 @@ def render_tg_sponsor(t):
                 "Show your channel to everyone who uses this proxy (Telegram's sponsored channel line). The tag comes from @MTProxybot.")
 
 
-def render_tg(st):
+def render_tg_local(st):
     t = tg_status()
     if t:
         ok = t["active"]
@@ -2691,6 +2707,93 @@ def render_tg(st):
     return card("Telegram proxy (MTProto, fake-TLS)", create,
                 "Runs on this server, independent of the tunnels. Use a server that can reach Telegram "
                 "(usually the foreign one). You get a link to share.")
+
+
+def _cp(i, val):
+    return (f"<div class=copy><input id={i} readonly value='{esc(val)}'>"
+            f"<button type=button class='btn g s' data-copy='#{i}'>Copy</button></div>")
+
+
+def render_tg_remote_card(st, d, s):
+    sid, tg = s["id"], s.get("tg")
+    h = {"id": sid, "tab": "telegram"}
+    head = f"<p><b>{esc(s['name'])}</b> <span class='mono mu'>{esc(s['ip'])}</span></p>"
+    refresh = form(dict(h, a="rtgrefresh"), "<button class='btn g s'>Check status</button>", cls="inl")
+    if not s.get("agent"):
+        return card("Telegram proxy", head + "<p class=mu>This server was added with a pasted token and cannot be controlled "
+                    "from here. Remove it and add it again with the join command.</p>")
+    if not tg:
+        body = (head + form(dict(h, a="rtgcreate"),
+                            fld("Port", "<input name=port value=443 class=w-s>")
+                            + fld("Cover domain", "<input name=host value='www.microsoft.com' class=w-l>")
+                            + "<button class=btn>Create proxy on this server</button>", cls="row")
+                + f"<div class=row style='margin-top:10px'>{refresh}</div>")
+        return card("Telegram proxy", body, "It is built ON that server (not on this panel). "
+                    "The first run downloads the engine there, so it can take a minute.")
+    pid = sid[:6]
+    body = (head + "<dl class=kv><dt>State</dt><dd>" + pill(tg.get("active", "?")) + f"</dd><dt>Port</dt><dd class=mono>{tg['port']}</dd>"
+            f"<dt>Cover domain</dt><dd class=mono>{esc(tg['host'])}</dd></dl>"
+            "<div style='margin-top:16px;display:grid;gap:10px'>"
+            + _cp("tgl" + pid, tg["links"]["https"]) + _cp("tgm" + pid, tg["links"]["tg"]) + "</div>")
+    sh_l = tg_share_links(st, s)
+    if sh_l:
+        body += ("<p class=hint style='margin-top:14px'>Link through the Iran server (port "
+                 f"{s['tg_share']}): for people inside Iran.</p><div style='display:grid;gap:10px'>"
+                 + _cp("tgs" + pid, sh_l["https"]) + "</div>")
+    body += ("<div class=row style='margin-top:16px'>" + refresh
+             + form(dict(h, a="rtgrestart"), "<button class='btn g s'>Restart</button>", cls="inl")
+             + form(dict(h, a="rtgrotate"), "<button class='btn g s'>New secret</button>",
+                    confirm="Old links will stop working. Continue?", cls="inl")
+             + form(dict(h, a="rtgremove"), "<button class='btn d s'>Remove proxy</button>",
+                    confirm="Remove the Telegram proxy from that server?", cls="inl") + "</div>")
+    out = card("Telegram proxy", body, "Running on the foreign server. Share the link with the people who need it.")
+    if st.get("role") == "iran" and d.get("active") == sid:
+        if s.get("tg_share"):
+            sbody = form(dict(h, a="rtgunshare"), "<button class='btn g'>Stop sharing through Iran</button>")
+        else:
+            sbody = form(dict(h, a="rtgshare"), fld("Port on the Iran server", f"<input name=port value={tg['port']} class=w-s>")
+                         + "<button class=btn>Also open it on the Iran server</button>", cls="row")
+        out += card("Use it from inside Iran", sbody,
+                    "Opens a port on this (Iran) server that forwards through the tunnel to the proxy, so users connect to an Iran IP.")
+    # sponsor
+    tag, ch = tg.get("tag", ""), tg.get("channel", "")
+    chl = ""
+    if ch:
+        chl = (f"<a href='https://t.me/{esc(ch[1:])}' target=_blank rel=noopener class=mono>{esc(ch)}</a>" if ch.startswith("@")
+               else f"<span class=mono>{esc(ch)}</span>")
+    state = ("<dl class=kv><dt>Sponsor</dt><dd>" + ("<span class='pill up'>Active</span> " + chl if tag else "Not set") + "</dd></dl>")
+    steps = ("<ol class=sp-steps>"
+             "<li>Open @MTProxybot in Telegram and send /newproxy.</li>"
+             "<li>Send the address below, then the secret below.</li>"
+             "<li>The bot answers with a tag. Paste it here.</li>"
+             "<li>In the bot: /myproxies, choose this proxy, Set promotion, and pick your channel (you must be its admin).</li></ol>")
+    boxes = ("<div style='display:grid;gap:10px;margin:12px 0'>" + _cp("tga" + pid, f"{tg['ip']}:{tg['port']}")
+             + _cp("tgb" + pid, tg["bot_secret"]) + "</div>")
+    f_ = form(dict(h, a="rtgtag"),
+              fld("Sponsor channel (@username or ID)", f"<input name=channel value='{esc(ch)}' class=w-m placeholder='@mychannel' autocomplete=off>")
+              + fld("Tag from @MTProxybot", f"<input name=tag value='{esc(tag)}' maxlength=32 class=w-l autocomplete=off>")
+              + "<button class=btn>Save sponsor</button>", cls="row")
+    rm = (form(dict(h, a="rtgtag", tag="", channel=""), "<button class='btn g'>Remove sponsor</button>",
+               confirm="Remove the sponsor from this proxy?") if tag else "")
+    note = ("<p class=hint>Telegram only lets the owner of the channel link it to a proxy, through @MTProxybot: "
+            "no program can do that step for you. The tag it gives is what makes the channel appear on top of Telegram "
+            "for everyone using this proxy. A new secret, port or cover domain clears the tag.</p>")
+    out += card("Sponsor channel", state + steps + boxes + f_ + (f"<div class=row style='margin-top:10px'>{rm}</div>" if rm else "") + note,
+                "Your channel shows on top of Telegram for everyone connected through this proxy.")
+    return out
+
+
+def render_tg(st):
+    if st["role"] == "foreign":
+        return render_tg_local(st)
+    d = srv_load()
+    srvs = [x for x in d["servers"] if x["status"] != "waiting"]
+    if not srvs:
+        o = card("Telegram proxy", "<p class=mu>Add the foreign server first (Servers tab). The proxy is then built on that "
+                 "server, from here, by its IP.</p><p><button type=button class=btn data-tab=servers>Open Servers</button></p>")
+    else:
+        o = "".join(render_tg_remote_card(st, d, x) for x in srvs)
+    return o + "<details><summary>Run a proxy on THIS server instead (advanced)</summary>" + render_tg_local(st) + "</details>"
 
 
 def render_logs():
@@ -3783,7 +3886,11 @@ def sys_act(st, a, f):
         rv = remote_version()
         return f"Installed v{VERSION}, latest v{rv}." if rv else ERR + "Could not check (no repo URL / no access)."
     if a == "update_script":
-        return update_script()
+        srv = update_servers() if st.get("role") != "foreign" else ""
+        me = update_script()
+        if not srv:
+            return me
+        return (ERR if me.startswith(ERR) else "") + srv + " | " + me.lstrip(ERR)
     if a == "update_gost":
         return update_gost()
     return tg_act(a, f)
@@ -3918,6 +4025,8 @@ class Handler(BaseHTTPRequestHandler):
             return srv_act(f)
         if a and a.startswith("nw"):
             return nw_act(f)
+        if a and a.startswith("rtg"):
+            return rtg_act({"role": "new"}, a, f)
         return sys_act({"role": "new", "panel": load_any()["panel"]}, a, f) or ""
 
     def act(self, st, f):
@@ -3926,6 +4035,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.act_new(f)
         if a and a.startswith("srv"):
             return srv_act(f) if st["role"] == "iran" else ERR + "Servers are managed from the Iran (entry) panel."
+        if a and a.startswith("rtg"):
+            return rtg_act(st, a, f) if st["role"] == "iran" else ERR + "Remote Telegram proxies are managed from the Iran panel."
         if a and a.startswith(("nw", "tn")):
             if st["role"] != "iran":
                 return ERR + "Tunnels are created and managed from the Iran (entry) panel."
@@ -4166,7 +4277,7 @@ def op_tg_create(ip, port="", host="", reuse_port=False):
     err = tg_install_engine()
     if err:
         return ERR + err
-    t = {"ip": ip, "port": port, "host": host, "secret": tg_secret(host), "tag": ""}
+    t = {"ip": ip, "port": port, "host": host, "secret": tg_secret(host), "tag": "", "channel": ""}
     _fw_apply(f"{port}/tcp", True)
     if not tg_up(t):
         return ERR + "The proxy did not start. See: journalctl -u night-tunnel-tg -n 30"
@@ -4179,7 +4290,7 @@ def op_tg_rotate():
         return ERR + "No Telegram proxy yet."
     t["secret"] = tg_secret(t["host"])
     had = bool(t.get("tag"))
-    t["tag"] = ""       # a sponsor tag belongs to the registered secret: it has to be registered again
+    t["tag"], t["channel"] = "", ""       # a sponsor tag belongs to the registered secret: it has to be registered again
     err = tg_install_engine()
     if err or not tg_up(t):
         return ERR + (err or "The proxy did not restart.")
@@ -4268,7 +4379,125 @@ def tg_status():
     t["links"] = tg_links(t)
     t["bot_secret"] = tg_user_secret(t)
     t.setdefault("tag", "")
+    t.setdefault("channel", "")
     return t
+
+
+TG_AGENT_CMDS = ("tgstatus", "tgcreate", "tgedit", "tgrotate", "tgrestart", "tgremove", "tgtag")
+
+
+def tg_channel_clean(v):
+    """Channel shown next to the sponsor: @username, t.me link or numeric id (-100...). '' = none."""
+    v = (v or "").strip()
+    v = re.sub(r"^(https?://)?(t\.me|telegram\.me)/", "", v).strip("/ ")
+    if not v:
+        return ""
+    if re.fullmatch(r"-?100\d{5,}", v):
+        return v
+    v = v.lstrip("@")
+    return "@" + v if re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{3,31}", v) else None
+
+
+def tg_agent(st, cmd, a):
+    """Telegram-proxy commands received from the Iran panel: they run HERE, on the exit (foreign) server."""
+    t = tg_load()
+    if cmd == "tgcreate":
+        return op_tg_create(st["foreign_ip"], str(a.get("port") or "443"), str(a.get("host") or ""))
+    if cmd == "tgstatus":
+        return ""
+    if not t:
+        return ERR + "No Telegram proxy on this server yet."
+    if cmd == "tgedit":
+        return op_tg_create(t["ip"], str(a.get("port") or t["port"]), str(a.get("host") or t["host"]))
+    if cmd == "tgrotate":
+        return op_tg_rotate()
+    if cmd == "tgrestart":
+        sh("systemctl restart night-tunnel-tg")
+        return "Restarted."
+    if cmd == "tgremove":
+        return op_tg_remove()
+    if cmd == "tgtag":
+        ch = tg_channel_clean(a.get("channel", ""))
+        if ch is None:
+            return ERR + "Channel: use @username, a t.me link or the numeric id."
+        msg = op_tg_tag(str(a.get("tag", "")))
+        if not msg.startswith(ERR):
+            t = tg_load() or t
+            t["channel"] = ch if t.get("tag") else ""
+            with open(TG_STATE, "w") as f:
+                json.dump(t, f)
+        return msg
+    return ERR + "Unknown command."
+
+
+def rtg_act(st, a, f):
+    """Controller side (Iran panel): drive the Telegram proxy that lives on a registered foreign server."""
+    d = srv_load()
+    s = srv_find(d, f.get("id", ""))
+    if not s:
+        return ERR + "Choose a server first (Servers tab)."
+    if a in ("rtgshare", "rtgunshare"):
+        return rtg_share(st, d, s, f, a == "rtgshare")
+    if not s.get("agent"):
+        return ERR + "This server was added with a pasted token, so it cannot be controlled from here. Re-add it with the join command."
+    cmd = {"rtgcreate": "tgcreate", "rtgedit": "tgedit", "rtgrotate": "tgrotate", "rtgrestart": "tgrestart",
+           "rtgremove": "tgremove", "rtgtag": "tgtag", "rtgrefresh": "tgstatus"}.get(a)
+    if not cmd:
+        return ERR + "Unknown action."
+    arg = {k: f.get(k, "").strip() for k in ("port", "host", "tag", "channel") if k in f}
+    try:
+        r = agent_call(s, cmd, json.dumps(arg), timeout=240)
+    except Exception as e:
+        m = str(e)
+        if "unknown command" in m:
+            m = ("this server runs an older night-tunnel without Telegram control. Update it "
+                 "(its panel: System > Update night-tunnel) or run the join command again")
+        return ERR + f"{s['name']}: {m}"
+    d = srv_load()
+    s = srv_find(d, s["id"])
+    s["tg"] = r.get("tg")
+    if cmd == "tgremove" and s.get("tg_share") and st.get("role") == "iran":
+        op_port_del(st, str(s["tg_share"]))
+        save(st)
+        apply(st)
+        s.pop("tg_share", None)
+    srv_save(d)
+    return r.get("msg") or "Updated."
+
+
+def rtg_share(st, d, s, f, on):
+    """Optional: also open the proxy on the Iran server, so people inside Iran connect to the Iran IP
+    and the traffic reaches the foreign proxy through the tunnel (only for the server that carries the tunnel)."""
+    if st.get("role") != "iran" or d.get("active") != s["id"]:
+        return ERR + "Sharing through Iran needs an active tunnel to this server."
+    if not on:
+        if s.get("tg_share"):
+            op_port_del(st, str(s["tg_share"]))
+            save(st)
+            apply(st)
+            s.pop("tg_share", None)
+            srv_save(d)
+        return "No longer shared through the Iran server."
+    tg = s.get("tg")
+    if not tg:
+        return ERR + "Create the Telegram proxy first."
+    port = (f.get("port") or "").strip() or str(tg["port"])
+    m = op_port_add(st, port, "tcp", str(tg["port"]))
+    if m.startswith(ERR):
+        return m
+    save(st)
+    apply(st)
+    s["tg_share"] = int(port)
+    srv_save(d)
+    return f"The proxy is now also on the Iran server, port {port}."
+
+
+def tg_share_links(st, s):
+    tg = s.get("tg") or {}
+    if not (s.get("tg_share") and tg):
+        return None
+    q = f"server={st['iran_ip']}&port={s['tg_share']}&secret={tg['secret']}"
+    return {"https": "https://t.me/proxy?" + q, "tg": "tg://proxy?" + q}
 
 
 def tg_menu():
@@ -4904,6 +5133,19 @@ def agent_serve(st, f, ip):
         save(st)
         apply(st)
         out = {"ok": True, "msg": msg, "token": make_token(st)}
+    elif cmd == "update":
+        msg = update_script()
+        out = {"ok": not msg.startswith(ERR), "msg": msg.lstrip(ERR), "v": VERSION}
+    elif cmd in TG_AGENT_CMDS:
+        try:
+            a = json.loads(f.get("arg") or "{}")
+            assert isinstance(a, dict)
+        except (ValueError, AssertionError):
+            return 400, '{"err":"bad arguments"}'
+        msg = tg_agent(st, cmd, a)
+        if msg.startswith(ERR):
+            return 400, json.dumps({"err": msg.lstrip(ERR)})
+        out = {"ok": True, "msg": msg, "tg": tg_status()}
     elif cmd in ("tpadd", "tpedit", "tpdel"):
         try:
             a = json.loads(f.get("arg") or "{}")
@@ -4927,12 +5169,32 @@ def agent_serve(st, f, ip):
     return 200, json.dumps(out)
 
 
-def agent_call(s, cmd, arg=""):
+def update_servers():
+    """Iran/controller panel: tell every registered server to update itself first (before this panel restarts)."""
+    d = srv_load()
+    todo = [x for x in d["servers"] if x["status"] != "waiting" and x.get("agent")]
+    if not todo:
+        return ""
+
+    def one(x):
+        try:
+            r = agent_call(x, "update", timeout=60)
+            return f"{x['name']}: {r.get('msg', 'updated')}"
+        except Exception as e:
+            m = str(e)
+            if "unknown command" in m:
+                m = "runs an old version without remote update; update it once by hand (its panel: System > Update night-tunnel)"
+            return f"{x['name']}: {m}"
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
+        return "Servers: " + "; ".join(ex.map(one, todo))
+
+
+def agent_call(s, cmd, arg="", timeout=90):
     a = s.get("agent") or {}
     if not a.get("key"):
         raise RuntimeError("no control channel (this server was added by pasting a token)")
     code, out = pinned_post(s["ip"], a["port"], f"/{a['path']}/agent", {"k": a["key"], "cmd": cmd, "arg": arg},
-                            a.get("fp", ""), 90)
+                            a.get("fp", ""), timeout)
     d = json.loads(out)
     if code != 200 or not d.get("ok"):
         raise RuntimeError(d.get("err") or d.get("msg") or f"agent error {code}")

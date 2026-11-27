@@ -167,3 +167,12 @@ MIT License
 - One unsupported transport can no longer take the others down: gost is retried per service and the broken one is switched off automatically.
 - Switched-off tunnels show **off** instead of **down**.
 - Creating a tunnel first re-enables the chosen tunnel(s) on the destination.
+
+## v1.8.2
+- **Telegram proxy is now built on the foreign server from the Iran panel.** Telegram tab → one card per registered server (Servers tab, by IP): create / check / restart / new secret / remove, all executed on that server through the control channel. The panel's own server is no longer the default place for the proxy.
+- Optional "Use it from inside Iran": opens a port on the Iran server that forwards through the tunnel to the proxy (for the server that carries the active tunnel).
+- Sponsor: channel (@username / link / ID) + tag from @MTProxybot, with exact steps (/newproxy, /myproxies → Set promotion). Linking a channel to a proxy can only be done by the channel owner inside @MTProxybot.
+- The destination must run v1.8.2 too (System → Update night-tunnel on its panel, or run the join command again).
+
+## v1.8.3
+- **Update from the Iran panel updates the foreign servers too.** "Update night-tunnel" first tells every registered server (joined by the join command) to update itself, then updates the Iran panel. The result lists each server. Servers older than 1.8.3 have no remote update: update them once by hand, after that it is automatic.
