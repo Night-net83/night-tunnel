@@ -34,7 +34,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlencode, urlparse
 
 NAME = "night-tunnel"
-VERSION = "1.8.0"
+VERSION = "1.8.1"
 BASE = os.environ.get("NT_BASE", "/etc/night-tunnel")
 STATE = BASE + "/state.json"
 GOST_CFG = BASE + "/gost.json"
@@ -93,6 +93,8 @@ BOOT = BASE + "/boot.json"           # panel-only config (panel started before a
 TGBASE = BASE + "-tg"                # Telegram proxy lives apart from the tunnel config (survives a tunnel reset)
 TG_STATE = TGBASE + "/tg.json"
 TG_CFG = TGBASE + "/mtg.toml"
+TG_PYCFG = TGBASE + "/config.py"      # config of the sponsor-capable engine, used only while a sponsor tag is set
+MTP_PATH = "/opt/night-tunnel/mtprotoproxy.py"
 
 G, Y, R, N = "\033[32m", "\033[33m", "\033[31m", "\033[0m"
 
@@ -1928,6 +1930,7 @@ background:rgba(148,163,184,.06);border:1px solid var(--line2);transition:border
 .item:last-child{border-bottom:0;padding-bottom:0}.item:first-child{padding-top:0}
 .item .hd{display:flex;align-items:center;gap:9px;width:100%;margin-bottom:-2px;flex-wrap:wrap}
 .kv{display:grid;grid-template-columns:max-content 1fr;gap:8px 18px;margin:0}
+.sp-steps{margin:14px 0 0;padding-inline-start:22px}.sp-steps li{margin:7px 0}
 .kv dt{color:var(--mu)}.kv dd{margin:0;word-break:break-all}
 .copy{display:flex;gap:8px;align-items:center}.copy input{flex:1;min-width:0;direction:ltr;text-align:left}
 .seg{font:inherit;color:var(--mu);background:rgba(148,163,184,.07);border:1px solid var(--line2);padding:6px 13px;border-radius:99px;cursor:pointer}
@@ -2217,6 +2220,28 @@ FA_TEXT.update({
     "Create Iran (entry) side": "ساخت سمت ایران (ورودی)",
 })
 
+FA_TEXT.update({
+    # sponsor channel
+    "Sponsor channel": "کانال اسپانسر", "Sponsor": "اسپانسر", "Active": "فعال", "Not set": "تنظیم نشده",
+    "Sponsor tag": "تگ اسپانسر", "Save sponsor": "ذخیره اسپانسر", "Remove sponsor": "حذف اسپانسر",
+    "Remove the sponsor from this proxy?": "اسپانسر از این پروکسی حذف شود؟",
+    "Show your channel to everyone who uses this proxy (Telegram's sponsored channel line). The tag comes from @MTProxybot.":
+        "کانال شما به همه‌ی کسانی که از این پروکسی استفاده می‌کنند نشان داده می‌شود (خط «کانال اسپانسر» تلگرام). تگ را \u2066@MTProxybot\u2069 می‌دهد.",
+    "Open @MTProxybot in Telegram and send /newproxy.": "در تلگرام \u2066@MTProxybot\u2069 را باز کنید و \u2066/newproxy\u2069 را بفرستید.",
+    "Send this address when it asks for the proxy.": "وقتی آدرس پروکسی را خواست، آدرس پایین را بفرستید.",
+    "Send this secret when it asks for the secret.": "وقتی سکرت را خواست، مقدار پایین را بفرستید.",
+    "Choose your sponsor channel. The bot answers with a tag: paste it below.":
+        "کانال اسپانسر خود را انتخاب کنید. ربات یک تگ می‌دهد؛ آن را پایین بچسبانید.",
+    "A sponsor needs a different engine; it is installed automatically when you save. Changing the port, the cover domain or the secret clears the tag: register the new secret with @MTProxybot again.":
+        "اسپانسر موتور دیگری می‌خواهد؛ هنگام ذخیره خودکار نصب می‌شود. با تغییر پورت، دامنه پوششی یا سکرت، تگ پاک می‌شود: سکرت جدید را دوباره در \u2066@MTProxybot\u2069 ثبت کنید.",
+    "Sponsor tag saved; the proxy now shows your sponsor channel.": "تگ اسپانسر ذخیره شد؛ پروکسی حالا کانال اسپانسر شما را نشان می‌دهد.",
+    "Sponsor tag removed.": "تگ اسپانسر حذف شد.",
+    "Create the Telegram proxy first.": "اول پروکسی تلگرام را بسازید.",
+    "The tag is 32 hex characters (0-9, a-f), as given by @MTProxybot.": "تگ ۳۲ کاراکتر هگز (۰-۹ و a-f) است، همان‌طور که \u2066@MTProxybot\u2069 می‌دهد.",
+    "The sponsor was cleared: register the new secret with @MTProxybot again.": "اسپانسر پاک شد: سکرت جدید را دوباره در \u2066@MTProxybot\u2069 ثبت کنید.",
+    "Restarted.": "ری‌استارت شد.", "Panel password changed.": "رمز پنل عوض شد.",
+    "Use at least 8 characters.": "حداقل ۸ کاراکتر بگذارید.", "The two passwords differ.": "دو رمز یکسان نیستند.",
+})
 JS = JS_TPL.replace("__FA__", json.dumps(FA_TEXT, ensure_ascii=False))
 
 
@@ -2606,6 +2631,30 @@ def render_security(st):
     return card("Security mode", txt)
 
 
+def render_tg_sponsor(t):
+    """Sponsor channel: the tag comes from @MTProxybot and is bound to this proxy's secret."""
+    tag = t.get("tag", "")
+    steps = ("<ol class=sp-steps>"
+             "<li>Open @MTProxybot in Telegram and send /newproxy.</li>"
+             "<li>Send this address when it asks for the proxy.</li>"
+             "<li>Send this secret when it asks for the secret.</li>"
+             "<li>Choose your sponsor channel. The bot answers with a tag: paste it below.</li></ol>")
+    boxes = ("<div style='display:grid;gap:10px;margin:12px 0'>"
+             f"<div class=copy><input id=tgaddr readonly value='{esc(t['ip'])}:{t['port']}'>"
+             "<button type=button class='btn g s' data-copy='#tgaddr'>Copy</button></div>"
+             f"<div class=copy><input id=tgbotsec readonly value='{esc(t['bot_secret'])}'>"
+             "<button type=button class='btn g s' data-copy='#tgbotsec'>Copy</button></div></div>")
+    save_f = form({"a": "tgtag"}, fld("Sponsor tag", f"<input name=tag value='{esc(tag)}' maxlength=32 class=w-l autocomplete=off>")
+                  + "<button class=btn>Save sponsor</button>", cls="row")
+    rm = (form({"a": "tgtag", "tag": ""}, "<button class='btn g'>Remove sponsor</button>",
+               confirm="Remove the sponsor from this proxy?") if tag else "")
+    state = ("<dl class=kv><dt>Sponsor</dt><dd>" + ("<span class='pill up'>Active</span>" if tag else "Not set") + "</dd></dl>")
+    note = ("<p class=hint>A sponsor needs a different engine; it is installed automatically when you save. "
+            "Changing the port, the cover domain or the secret clears the tag: register the new secret with @MTProxybot again.</p>")
+    return card("Sponsor channel", state + steps + boxes + save_f + (f"<div class=row style='margin-top:10px'>{rm}</div>" if rm else "") + note,
+                "Show your channel to everyone who uses this proxy (Telegram's sponsored channel line). The tag comes from @MTProxybot.")
+
+
 def render_tg(st):
     t = tg_status()
     if t:
@@ -2630,6 +2679,7 @@ def render_tg(st):
                     + "<button class=btn>Apply</button>", cls="row")
         return (card("Telegram proxy (MTProto, fake-TLS)", body,
                      "Runs on this server, independent of the tunnels. Share the link with people who need it.")
+                + render_tg_sponsor(t)
                 + card("Change port or cover domain", edit, "The secret is regenerated, so share the new link afterwards."))
     ip = st["panel"].get("host", "")
     ip = ip if valid_ip(ip) else ""
@@ -3880,7 +3930,7 @@ class Handler(BaseHTTPRequestHandler):
             if st["role"] != "iran":
                 return ERR + "Tunnels are created and managed from the Iran (entry) panel."
             return nw_act(f) if a.startswith("nw") else tn_act(f)
-        if a in ("tgcreate", "tgedit", "tgrestart", "tgrotate", "tgremove", "wizclear", "chpw", "bbr",
+        if a in ("tgcreate", "tgedit", "tgrestart", "tgrotate", "tgremove", "tgtag", "wizclear", "chpw", "bbr",
                  "checkver", "update_script", "update_gost"):
             return sys_act(st, a, f)
         if a == "save":
@@ -4031,11 +4081,48 @@ def tg_install_engine():
         shutil.rmtree(d, ignore_errors=True)
 
 
+def tg_user_secret(t):
+    """The plain 32-hex secret (what @MTProxybot asks for). The link secret is 'ee' + this + the cover domain."""
+    return t["secret"][2:34]
+
+
+def tg_install_mtp():
+    """A sponsor tag needs an engine that supports it (mtg v2 has none): the Python mtprotoproxy.
+    MTP_URL=<link to mtprotoproxy.py> helps on servers that cannot reach GitHub."""
+    if os.path.exists(MTP_PATH):
+        return ""
+    sh("DEBIAN_FRONTEND=noninteractive apt-get install -y python3-cryptography")
+    url = os.environ.get("MTP_URL") or "https://raw.githubusercontent.com/alexbers/mtprotoproxy/master/mtprotoproxy.py"
+    os.makedirs(os.path.dirname(MTP_PATH), exist_ok=True)
+    tmp = MTP_PATH + ".new"
+    if sh(f"curl -fsSL --max-time 60 {shlex.quote(url)} -o {shlex.quote(tmp)}").returncode != 0:
+        return "Could not download the sponsor-capable engine (GitHub unreachable? Set MTP_URL=<link to mtprotoproxy.py>)."
+    try:
+        with open(tmp, encoding="utf-8") as f:
+            src = f.read()
+        ast.parse(src)
+        assert "AD_TAG" in src
+    except Exception:
+        os.path.exists(tmp) and os.remove(tmp)
+        return "The downloaded engine file is not valid."
+    os.replace(tmp, MTP_PATH)
+    os.chmod(MTP_PATH, 0o700)
+    return ""
+
+
 def tg_write_cfg(t):
     os.makedirs(TGBASE, exist_ok=True)
     with open(TG_CFG, "w") as f:
         f.write(f'secret = "{t["secret"]}"\nbind-to = "0.0.0.0:{t["port"]}"\n')
     os.chmod(TG_CFG, 0o600)
+    if t.get("tag"):
+        with open(TG_PYCFG, "w") as f:
+            f.write(f'PORT = {int(t["port"])}\nUSERS = {{"tg": "{tg_user_secret(t)}"}}\n'
+                    'MODES = {"classic": False, "secure": False, "tls": True}\n'
+                    f'TLS_DOMAIN = "{t["host"]}"\nAD_TAG = "{t["tag"]}"\n')
+        os.chmod(TG_PYCFG, 0o600)
+    elif os.path.exists(TG_PYCFG):
+        os.remove(TG_PYCFG)
     with open(TG_STATE, "w") as f:
         json.dump(t, f)
     os.chmod(TG_STATE, 0o600)
@@ -4079,7 +4166,7 @@ def op_tg_create(ip, port="", host="", reuse_port=False):
     err = tg_install_engine()
     if err:
         return ERR + err
-    t = {"ip": ip, "port": port, "host": host, "secret": tg_secret(host)}
+    t = {"ip": ip, "port": port, "host": host, "secret": tg_secret(host), "tag": ""}
     _fw_apply(f"{port}/tcp", True)
     if not tg_up(t):
         return ERR + "The proxy did not start. See: journalctl -u night-tunnel-tg -n 30"
@@ -4091,9 +4178,70 @@ def op_tg_rotate():
     if not t:
         return ERR + "No Telegram proxy yet."
     t["secret"] = tg_secret(t["host"])
+    had = bool(t.get("tag"))
+    t["tag"] = ""       # a sponsor tag belongs to the registered secret: it has to be registered again
+    err = tg_install_engine()
+    if err or not tg_up(t):
+        return ERR + (err or "The proxy did not restart.")
+    return ("New secret generated (old links stop working)."
+            + (" The sponsor was cleared: register the new secret with @MTProxybot again." if had else "")
+            + " Link: " + tg_links(t)["https"])
+
+
+def op_tg_tag(tag):
+    """Set or clear the sponsor tag (from @MTProxybot). With a tag the proxy runs on the sponsor-capable engine."""
+    t = tg_load()
+    if not t:
+        return ERR + "Create the Telegram proxy first."
+    tag = (tag or "").strip().lower()
+    if tag and not re.fullmatch(r"[0-9a-f]{32}", tag):
+        return ERR + "The tag is 32 hex characters (0-9, a-f), as given by @MTProxybot."
+    err = tg_install_mtp() if tag else tg_install_engine()
+    if err:
+        return ERR + err
+    t["tag"] = tag
     if not tg_up(t):
-        return ERR + "The proxy did not restart."
-    return "New secret generated (old links stop working). Link: " + tg_links(t)["https"]
+        return ERR + "The proxy did not start. See: journalctl -u night-tunnel-tg -n 30"
+    return "Sponsor tag saved; the proxy now shows your sponsor channel." if tag else "Sponsor tag removed."
+
+
+def tg_act(a, f):
+    """Telegram-proxy panel actions (work with or without a tunnel). Returns a message, or None if not ours."""
+    if a == "tgcreate":
+        return op_tg_create(f.get("ip", "").strip(), f.get("port", "443").strip(), f.get("host", "").strip())
+    if a == "tgedit":
+        t = tg_load()
+        if not t:
+            return ERR + "Create the Telegram proxy first."
+        return op_tg_create(t["ip"], f.get("port", "").strip() or str(t["port"]), f.get("host", "").strip() or t["host"])
+    if a == "tgrestart":
+        sh("systemctl restart night-tunnel-tg")
+        return "Restarted."
+    if a == "tgrotate":
+        return op_tg_rotate()
+    if a == "tgremove":
+        return op_tg_remove()
+    if a == "tgtag":
+        return op_tg_tag(f.get("tag", ""))
+    return None
+
+
+def op_panel_pw(st, pw1, pw2):
+    """Change the panel password (also before any tunnel exists)."""
+    if len(pw1) < 8:
+        return ERR + "Use at least 8 characters."
+    if pw1 != pw2:
+        return ERR + "The two passwords differ."
+    panel = st["panel"]
+    panel["salt"] = secrets.token_hex(16)
+    panel["pass_hash"] = hash_pw(pw1, panel["salt"])
+    if st["role"] == "new":
+        boot = _boot_panel() or {"le": ""}
+        boot["panel"] = panel
+        _write_boot(boot)
+    else:
+        save(st)
+    return "Panel password changed."
 
 
 def op_tg_remove(purge=False):
@@ -4105,8 +4253,9 @@ def op_tg_remove(purge=False):
     os.path.exists(p) and os.remove(p)
     sh("systemctl daemon-reload")
     shutil.rmtree(TGBASE, ignore_errors=True)
-    if purge and os.path.exists("/usr/local/bin/mtg"):
-        os.remove("/usr/local/bin/mtg")
+    if purge:
+        for b in ("/usr/local/bin/mtg", MTP_PATH):
+            os.path.exists(b) and os.remove(b)
     return "Telegram proxy removed."
 
 
@@ -4117,6 +4266,8 @@ def tg_status():
     t = dict(t)
     t["active"] = sh("systemctl is-active night-tunnel-tg").stdout.strip()
     t["links"] = tg_links(t)
+    t["bot_secret"] = tg_user_secret(t)
+    t.setdefault("tag", "")
     return t
 
 
@@ -4129,7 +4280,9 @@ def tg_menu():
             print(f"State : {t['active']}   Port: {t['port']}   Cover domain: {t['host']}")
             print(f"Link  : {t['links']['https']}")
             print(f"Also  : {t['links']['tg']}")
-            c = input("\na) new secret   b) change port / cover domain   c) logs   d) restart   e) remove   0) back : ").strip().lower()
+            print(f"Sponsor: {t['tag'] or '(none)'}   Secret for @MTProxybot: {t['bot_secret']}")
+            c = input("\na) new secret   b) change port / cover domain   c) logs   d) restart   e) remove"
+                      "\nf) sponsor channel (tag from @MTProxybot)   0) back : ").strip().lower()
         else:
             print("No proxy yet. It runs on THIS server and is independent of the tunnels.")
             say("Tip: use a server that can reach Telegram (normally the foreign server).", Y)
@@ -4145,6 +4298,11 @@ def tg_menu():
             m = op_tg_rotate()
         elif c == "b":
             m = op_tg_create(t["ip"], ask("Port", str(t["port"])), ask("Cover domain", t["host"]))
+        elif c == "f":
+            say(f"1) In Telegram open @MTProxybot and send /newproxy, then send it:  {t['ip']}:{t['port']}", Y)
+            say(f"2) When it asks for the secret send:  {t['bot_secret']}", Y)
+            say("3) Pick your sponsor channel there. It answers with a tag: paste it below (empty = remove the sponsor).", Y)
+            m = op_tg_tag(ask("Sponsor tag"))
         elif c == "c":
             print(sh("journalctl -u night-tunnel-tg -n 40 --no-pager").stdout)
             continue
@@ -4203,22 +4361,30 @@ WantedBy=multi-user.target
 }
 
 
-def write_units(names=None):
-    """Write the systemd units (the single source of truth; install.sh and the remote installer call this)."""
-    units = dict(UNITS)
-    units["night-tunnel-tg"] = f"""[Unit]
-Description=night-tunnel Telegram proxy (mtg)
+def tg_unit_text():
+    """The Telegram proxy service: mtg normally, the sponsor-capable engine while a sponsor tag is set."""
+    sponsor = bool((tg_load() or {}).get("tag"))
+    exe, cond = ((f"/usr/bin/python3 {MTP_PATH} {TG_PYCFG}", TG_PYCFG) if sponsor
+                 else (f"/usr/local/bin/mtg run {TG_CFG}", TG_CFG))
+    return f"""[Unit]
+Description=night-tunnel Telegram proxy
 After=network-online.target
 Wants=network-online.target
-ConditionPathExists={TG_CFG}
+ConditionPathExists={cond}
 [Service]
-ExecStart=/usr/local/bin/mtg run {TG_CFG}
+ExecStart={exe}
 Restart=always
 RestartSec=3
 LimitNOFILE=1048576
 [Install]
 WantedBy=multi-user.target
 """
+
+
+def write_units(names=None):
+    """Write the systemd units (the single source of truth; install.sh and the remote installer call this)."""
+    units = dict(UNITS)
+    units["night-tunnel-tg"] = tg_unit_text()
     for n, body in units.items():
         if names and n not in names:
             continue
